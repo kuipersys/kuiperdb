@@ -1,0 +1,335 @@
+#!/usr/bin/env pwsh
+<#
+.SYNOPSIS
+    Version and publish KuiperDb npm packages
+
+.DESCRIPTION
+    This script builds, versions, and publishes the KuiperDb npm packages to the npm registry.
+    It handles the packages in the correct dependency order:
+    1. @kuiperdb/client (kuiperdb-ts)
+    2. @kuiperdb/react (kuiperdb-react)
+
+.PARAMETER VersionBump
+    The type of version bump to perform: patch, minor, or major.
+    Default: patch
+
+.PARAMETER DryRun
+    If set, performs all steps except the actual npm publish
+
+.PARAMETER SkipBuild
+    If set, skips the build step (useful if you've already built)
+
+.PARAMETER Tag
+    The npm dist-tag to publish under (e.g., 'latest', 'beta', 'next')
+    Default: latest
+
+.PARAMETER Organization
+    The npm organization name for verification and publishing.
+    Default: kuipersys
+
+.PARAMETER Otp
+    One-time password from your authenticator app (for TOTP-based 2FA).
+    Not needed if using security key - npm will prompt automatically.
+
+.EXAMPLE
+    .\scripts\npm-publish.ps1 -VersionBump patch
+    
+.EXAMPLE
+    .\scripts\npm-publish.ps1 -VersionBump minor -DryRun
+
+.EXAMPLE
+    .\scripts\npm-publish.ps1 -VersionBump major -Tag beta
+
+.EXAMPLE
+    .\scripts\npm-publish.ps1 -VersionBump patch -Organization myorg
+
+.EXAMPLE
+    .\scripts\npm-publish.ps1 -VersionBump patch -Otp 123456
+#>
+
+param(
+    [Parameter()]
+    [ValidateSet('patch', 'minor', 'major')]
+    [string]$VersionBump = 'patch',
+    
+    [Parameter()]
+    [switch]$DryRun,
+    
+    [Parameter()]
+    [switch]$SkipBuild,
+    
+    [Parameter()]
+    [string]$Tag = 'latest',
+    
+    [Parameter()]
+    [string]$Organization = 'kuipersys',
+    
+    [Parameter()]
+    [string]$Otp
+)
+
+$ErrorActionPreference = 'Stop'
+
+# Get the workspace root (parent directory of scripts)
+$WorkspaceRoot = Split-Path -Parent $PSScriptRoot
+
+# Define package directories in dependency order
+$Packages = @(
+    @{
+        Name = "@kuiperdb/client"
+        Path = Join-Path $WorkspaceRoot "src\kuiperdb-ts"
+        DisplayName = "KuiperDb TypeScript Client"
+    },
+    @{
+        Name = "@kuiperdb/react"
+        Path = Join-Path $WorkspaceRoot "src\kuiperdb-react"
+        DisplayName = "KuiperDb React Components"
+    }
+)
+
+function Write-Step {
+    param([string]$Message)
+    Write-Host "`n==> $Message" -ForegroundColor Cyan
+}
+
+function Write-Success {
+    param([string]$Message)
+    Write-Host "✓ $Message" -ForegroundColor Green
+}
+
+function Write-Warning {
+    param([string]$Message)
+    Write-Host "⚠ $Message" -ForegroundColor Yellow
+}
+
+function Write-Error {
+    param([string]$Message)
+    Write-Host "✗ $Message" -ForegroundColor Red
+}
+
+function Get-PackageVersion {
+    param([string]$PackagePath)
+    
+    $packageJsonPath = Join-Path $PackagePath "package.json"
+    $packageJson = Get-Content $packageJsonPath | ConvertFrom-Json
+    return $packageJson.version
+}
+
+function Test-NpmAuth {
+    param([string]$Organization)
+    
+    Write-Step "Checking npm authentication..."
+    
+    try {
+        $whoami = npm whoami 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Write-Error "Not authenticated with npm"
+            Write-Host "Please run: npm login" -ForegroundColor Yellow
+            return $false
+        }
+        
+        Write-Success "Authenticated as: $whoami"
+        
+        # Check organization access
+        Write-Host "  Verifying organization access..." -NoNewline
+        $orgAccess = npm org ls $Organization 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host " ✓" -ForegroundColor Green
+            Write-Success "Has access to organization: @$Organization"
+            return $true
+        } else {
+            Write-Host "" # newline
+            Write-Warning "Unable to verify access to organization '@$Organization'"
+            Write-Host "  This might be fine if the organization doesn't exist yet or uses different access controls."
+            Write-Host "  Make sure you have publish permissions for @$Organization scope." -ForegroundColor Yellow
+            
+            $confirm = Read-Host "  Continue anyway? (yes/no)"
+            return ($confirm -eq 'yes')
+        }
+    } catch {
+        Write-Error "Failed to check npm authentication: $_"
+        return $false
+    }
+}
+
+function Update-PackageVersion {
+    param(
+        [string]$PackagePath,
+        [string]$VersionBump
+    )
+    
+    Push-Location $PackagePath
+    try {
+        Write-Host "  Bumping version ($VersionBump)..." -NoNewline
+        npm version $VersionBump --no-git-tag-version | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            throw "npm version failed"
+        }
+        $newVersion = Get-PackageVersion -PackagePath $PackagePath
+        Write-Host " → $newVersion" -ForegroundColor Green
+        return $newVersion
+    } finally {
+        Pop-Location
+    }
+}
+
+function Build-Package {
+    param([string]$PackagePath)
+    
+    Push-Location $PackagePath
+    try {
+        Write-Host "  Building package..." -NoNewline
+        
+        # Clean dist directory if it exists
+        $distPath = Join-Path $PackagePath "dist"
+        if (Test-Path $distPath) {
+            Remove-Item -Recurse -Force $distPath
+        }
+        
+        npm run build 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            throw "Build failed"
+        }
+        Write-Host " Done" -ForegroundColor Green
+    } finally {
+        Pop-Location
+    }
+}
+
+function Publish-Package {
+    param(
+        [string]$PackagePath,
+        [string]$Tag,
+        [bool]$DryRun,
+        [string]$Otp
+    )
+    
+    Push-Location $PackagePath
+    try {
+        if ($DryRun) {
+            Write-Host "  [DRY RUN] Would publish with tag '$Tag'" -ForegroundColor Yellow
+        } else {
+            Write-Host "  Publishing to npm (tag: $Tag)..." -NoNewline
+            
+            if ($Otp) {
+                npm publish --access public --tag $Tag --otp $Otp
+            } else {
+                npm publish --access public --tag $Tag
+            }
+            
+            if ($LASTEXITCODE -ne 0) {
+                throw "Publish failed"
+            }
+            Write-Host " Done" -ForegroundColor Green
+        }
+    } finally {
+        Pop-Location
+    }
+}
+
+# Main script execution
+try {
+    Write-Host @"
+
+╔══════════════════════════════════════════════════════════╗
+║         KuiperDb NPM Package Publisher                  ║
+╚══════════════════════════════════════════════════════════╝
+
+"@ -ForegroundColor Cyan
+
+    # Check if we're in the right directory
+    if (-not (Test-Path (Join-Path $WorkspaceRoot "Cargo.toml"))) {
+        throw "This script must be run from the KuiperDb workspace root or scripts directory"
+    }
+
+    # Verify all packages exist
+    Write-Step "Verifying package directories..."
+    foreach ($pkg in $Packages) {
+        if (-not (Test-Path $pkg.Path)) {
+            throw "Package directory not found: $($pkg.Path)"
+        }
+        Write-Success "$($pkg.DisplayName) found at $($pkg.Path)"
+    }
+
+    # Check npm authentication (skip in dry run)
+    if (-not $DryRun) {
+        if (-not (Test-NpmAuth -Organization $Organization)) {
+            exit 1
+        }
+    } else {
+        Write-Warning "Dry run mode - skipping authentication check"
+    }
+
+    # Display current versions
+    Write-Step "Current versions:"
+    foreach ($pkg in $Packages) {
+        $version = Get-PackageVersion -PackagePath $pkg.Path
+        Write-Host "  $($pkg.Name): $version"
+    }
+
+    # Confirm with user
+    if (-not $DryRun) {
+        Write-Host "`nThis will bump all packages by: $VersionBump" -ForegroundColor Yellow
+        Write-Host "Tag: $Tag" -ForegroundColor Yellow
+        $confirm = Read-Host "Continue? (yes/no)"
+        if ($confirm -ne 'yes') {
+            Write-Warning "Aborted by user"
+            exit 0
+        }
+    }
+
+    # Update versions
+    Write-Step "Updating package versions..."
+    $versions = @{}
+    foreach ($pkg in $Packages) {
+        Write-Host "`n$($pkg.DisplayName):" -ForegroundColor White
+        $newVersion = Update-PackageVersion -PackagePath $pkg.Path -VersionBump $VersionBump
+        $versions[$pkg.Name] = $newVersion
+    }
+
+    # Build packages
+    if (-not $SkipBuild) {
+        Write-Step "Building packages..."
+        foreach ($pkg in $Packages) {
+            Write-Host "`n$($pkg.DisplayName):" -ForegroundColor White
+            Build-Package -PackagePath $pkg.Path
+        }
+    } else {
+        Write-Warning "Skipping build step"
+    }
+
+    # Publish packages
+    Write-Step "Publishing packages..."
+    foreach ($pkg in $Packages) {
+        Write-Host "`n$($pkg.DisplayName):" -ForegroundColor White
+        Publish-Package -PackagePath $pkg.Path -Tag $Tag -DryRun $DryRun -Otp $Otp
+    }
+
+    # Summary
+    Write-Host "`n" -NoNewline
+    Write-Host "═══════════════════════════════════════════════════════════" -ForegroundColor Green
+    if ($DryRun) {
+        Write-Host "DRY RUN COMPLETE" -ForegroundColor Yellow
+    } else {
+        Write-Host "PUBLISH COMPLETE" -ForegroundColor Green
+    }
+    Write-Host "═══════════════════════════════════════════════════════════" -ForegroundColor Green
+    
+    Write-Host "`nPublished versions:" -ForegroundColor Cyan
+    foreach ($pkg in $Packages) {
+        Write-Host "  $($pkg.Name)@$($versions[$pkg.Name])" -ForegroundColor White
+    }
+    
+    if (-not $DryRun) {
+        Write-Host "`nPackages are now available on npm!" -ForegroundColor Green
+        Write-Host "`nInstall with:" -ForegroundColor Cyan
+        Write-Host "  npm install $($Packages[0].Name)@$($versions[$Packages[0].Name])" -ForegroundColor White
+        Write-Host "  npm install $($Packages[1].Name)@$($versions[$Packages[1].Name])" -ForegroundColor White
+    }
+
+} catch {
+    Write-Host "`n" -NoNewline
+    Write-Error "Error: $_"
+    Write-Host $_.ScriptStackTrace -ForegroundColor Red
+    exit 1
+}
