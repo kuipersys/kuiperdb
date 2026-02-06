@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+
+members = [
+    "src/kuiperdb-core",
+    "src/kuiperdb-rs",
+    "src/kuiperdb-server",
+]
+
+[workspace.package]
+version = "0.1.1"
+edition = "2021"
+authors = ["KuiperDb Contributors"]
+license = "MIT"
+repository = "https://github.com/yourusername/kuiperdb"
+
+[workspace.dependencies]
+# Shared dependencies across workspace
+tokio = { version = "1.41", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-opentelemetry = "0.27"
+opentelemetry = "0.27"
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.27", features = ["default"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.11", features = ["v4", "serde"] }

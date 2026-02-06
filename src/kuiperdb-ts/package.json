@@ -1,0 +1,32 @@
+{
+  "name": "@kuiperdb/client",
+  "version": "0.1.0",
+  "description": "TypeScript/JavaScript client for KuiperDb - a vector database with document relations",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc --watch",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "kuiperdb",
+    "client",
+    "typescript",
+    "vector-database",
+    "embeddings",
+    "document-relations",
+    "graph",
+    "rag"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "axios": "^1.6.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.3.0"
+  }
+}

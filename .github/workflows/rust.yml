@@ -1,0 +1,167 @@
+# This workflow will build the Rust workspace
+# For more information see: https://doc.rust-lang.org/cargo/
+
+name: Build
+
+on:
+  push:
+    branches: [ "main" ]
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache cargo registry
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/registry
+        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Cache cargo index
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/git
+        key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Cache cargo build
+      uses: actions/cache@v4
+      with:
+        path: target
+        key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Build workspace
+      run: cargo build --workspace --verbose
+
+    - name: Run tests
+      run: cargo test --workspace --verbose
+
+    - name: Check formatting
+      run: cargo fmt --all -- --check
+
+    - name: Run clippy
+      run: cargo clippy --workspace -- -D warnings
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Install Nerdbank.GitVersioning
+      run: dotnet tool install --global nbgv
+
+    - name: Set version
+      id: nbgv
+      run: |
+        $version = nbgv get-version -v Version
+        $semver = nbgv get-version -v SemVer2
+        echo "VERSION=$version" >> $env:GITHUB_OUTPUT
+        echo "SEMVER=$semver" >> $env:GITHUB_OUTPUT
+
+    - name: Cache cargo registry
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/registry
+        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Cache cargo index
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/git
+        key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Cache cargo build
+      uses: actions/cache@v4
+      with:
+        path: target
+        key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Build Windows release binary
+      run: cargo build --release --bin kuiperdb-server
+
+    - name: Rename binary
+      run: |
+        Copy-Item target/release/kuiperdb-server.exe kuiperdb-windows-amd64.exe
+
+    - name: Upload Windows artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: kuiperdb-windows-amd64
+        path: kuiperdb-windows-amd64.exe
+        retention-days: 30
+
+  build-linux-release:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Build Linux release binary
+      run: cargo build --release --bin kuiperdb-server
+
+    - name: Strip binary
+      run: strip target/release/kuiperdb-server
+
+    - name: Rename binary
+      run: cp target/release/kuiperdb-server kuiperdb-linux-amd64
+
+    - name: Upload Linux artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: kuiperdb-linux-amd64
+        path: kuiperdb-linux-amd64
+        retention-days: 30
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build, build-windows, build-linux-release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Download Windows artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: kuiperdb-windows-amd64
+        path: .
+
+    - name: Download Linux artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: kuiperdb-linux-amd64
+        path: .
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          kuiperdb-windows-amd64.exe
+          kuiperdb-linux-amd64
+        generate_release_notes: true
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

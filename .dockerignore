@@ -1,0 +1,46 @@
+# Build artifacts
+target/
+**/target/
+
+node_modules/
+**/node_modules/
+
+dist/
+**/dist/
+
+# Data and logs
+data/
+logs/
+*.log
+
+# Git
+.git/
+.github/
+.gitignore
+
+# Documentation
+*.md
+!README.md
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# CI/CD
+.github/
+
+# Scripts
+scripts/
+*.ps1
+*.sh
+
+# Docker
+Dockerfile
+.dockerignore

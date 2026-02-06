@@ -1,0 +1,37 @@
+{
+  "embedding_url": "https://192.168.91.57/embed",
+  "embedding_dimensions": 2560,
+  "data_dir": "./data",
+  "port": "8080",
+  "insecure_skip_verify": true,
+  "ca_cert_path": "",
+  "num_embedding_workers": 10,
+  "embedding_batch_size": 1,
+  "cors": {
+    "enabled": true,
+    "allowed_origins": []
+  },
+  "features": {
+    "embedding": true,
+    "embedding_job": true,
+    "embedding_cache": true,
+    "vector_index": true,
+    "hybrid_search": true,
+    "chunking": true,
+    "document_relations": true
+  },
+  "vector_index": {
+    "mode": "auto",
+    "threshold": 1000,
+    "hnsw_m": 16,
+    "hnsw_ef_construction": 200,
+    "hnsw_ef_search": 100
+  },
+  "chunking": {
+    "enabled": true,
+    "token_threshold": 512,
+    "chunk_size": 512,
+    "chunk_overlap": 50,
+    "strategy": "markdown"
+  }
+}

@@ -1,0 +1,32 @@
+{
+  "name": "@kuiperdb/react",
+  "version": "0.1.0",
+  "description": "React components and hooks for KuiperDb - a vector database with document relations",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc --watch"
+  },
+  "keywords": [
+    "kuiperdb",
+    "react",
+    "hooks",
+    "provider",
+    "context",
+    "vector-database"
+  ],
+  "author": "",
+  "license": "MIT",
+  "peerDependencies": {
+    "react": "^18.0.0 || ^19.0.0"
+  },
+  "dependencies": {
+    "@kuiperdb/client": "file:../kuiperdb-ts"
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.0",
+    "typescript": "^5.3.0"
+  }
+}
