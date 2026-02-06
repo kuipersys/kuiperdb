@@ -173,6 +173,105 @@ function Update-PackageVersion {
     }
 }
 
+function Update-CrossPackageDependencies {
+    param(
+        [string]$PackagePath,
+        [hashtable]$Versions
+    )
+    
+    $packageJsonPath = Join-Path $PackagePath "package.json"
+    $packageJson = Get-Content $packageJsonPath -Raw | ConvertFrom-Json
+    
+    $updated = $false
+    $originalDeps = @{}
+    
+    # Update dependencies
+    if ($packageJson.dependencies) {
+        foreach ($dep in $packageJson.dependencies.PSObject.Properties) {
+            if ($dep.Value -match '^file:') {
+                # Store original value
+                $originalDeps[$dep.Name] = $dep.Value
+                
+                # Check if this is one of our published packages
+                $versionToUse = $null
+                foreach ($pkgName in $Versions.Keys) {
+                    if ($dep.Name -eq $pkgName) {
+                        $versionToUse = "^$($Versions[$pkgName])"
+                        break
+                    }
+                }
+                
+                if ($versionToUse) {
+                    Write-Host "    Updating $($dep.Name): $($dep.Value) → $versionToUse" -ForegroundColor Yellow
+                    $packageJson.dependencies.$($dep.Name) = $versionToUse
+                    $updated = $true
+                }
+            }
+        }
+    }
+    
+    # Update devDependencies
+    if ($packageJson.devDependencies) {
+        foreach ($dep in $packageJson.devDependencies.PSObject.Properties) {
+            if ($dep.Value -match '^file:') {
+                # Store original value
+                $originalDeps[$dep.Name] = $dep.Value
+                
+                # Check if this is one of our published packages
+                $versionToUse = $null
+                foreach ($pkgName in $Versions.Keys) {
+                    if ($dep.Name -eq $pkgName) {
+                        $versionToUse = "^$($Versions[$pkgName])"
+                        break
+                    }
+                }
+                
+                if ($versionToUse) {
+                    Write-Host "    Updating $($dep.Name): $($dep.Value) → $versionToUse" -ForegroundColor Yellow
+                    $packageJson.devDependencies.$($dep.Name) = $versionToUse
+                    $updated = $true
+                }
+            }
+        }
+    }
+    
+    if ($updated) {
+        $packageJson | ConvertTo-Json -Depth 100 | Set-Content $packageJsonPath -Encoding UTF8
+    }
+    
+    return $originalDeps
+}
+
+function Restore-CrossPackageDependencies {
+    param(
+        [string]$PackagePath,
+        [hashtable]$OriginalDeps
+    )
+    
+    if ($OriginalDeps.Count -eq 0) {
+        return
+    }
+    
+    $packageJsonPath = Join-Path $PackagePath "package.json"
+    $packageJson = Get-Content $packageJsonPath -Raw | ConvertFrom-Json
+    
+    foreach ($depName in $OriginalDeps.Keys) {
+        $originalValue = $OriginalDeps[$depName]
+        
+        if ($packageJson.dependencies -and $packageJson.dependencies.$depName) {
+            Write-Host "    Restoring $depName → $originalValue" -ForegroundColor Cyan
+            $packageJson.dependencies.$depName = $originalValue
+        }
+        
+        if ($packageJson.devDependencies -and $packageJson.devDependencies.$depName) {
+            Write-Host "    Restoring $depName → $originalValue" -ForegroundColor Cyan
+            $packageJson.devDependencies.$depName = $originalValue
+        }
+    }
+    
+    $packageJson | ConvertTo-Json -Depth 100 | Set-Content $packageJsonPath -Encoding UTF8
+}
+
 function Build-Package {
     param([string]$PackagePath)
     
@@ -287,6 +386,15 @@ try {
         $versions[$pkg.Name] = $newVersion
     }
 
+    # Update cross-package dependencies (file: → version)
+    Write-Step "Updating cross-package dependencies..."
+    $originalDepsMap = @{}
+    foreach ($pkg in $Packages) {
+        Write-Host "`n$($pkg.DisplayName):" -ForegroundColor White
+        $originalDeps = Update-CrossPackageDependencies -PackagePath $pkg.Path -Versions $versions
+        $originalDepsMap[$pkg.Path] = $originalDeps
+    }
+
     # Build packages
     if (-not $SkipBuild) {
         Write-Step "Building packages..."
@@ -303,6 +411,15 @@ try {
     foreach ($pkg in $Packages) {
         Write-Host "`n$($pkg.DisplayName):" -ForegroundColor White
         Publish-Package -PackagePath $pkg.Path -Tag $Tag -DryRun $DryRun -Otp $Otp
+    }
+
+    # Restore file: references for local development
+    Write-Step "Restoring local file references..."
+    foreach ($pkg in $Packages) {
+        if ($originalDepsMap[$pkg.Path].Count -gt 0) {
+            Write-Host "`n$($pkg.DisplayName):" -ForegroundColor White
+            Restore-CrossPackageDependencies -PackagePath $pkg.Path -OriginalDeps $originalDepsMap[$pkg.Path]
+        }
     }
 
     # Summary
