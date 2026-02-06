@@ -1,6 +1,6 @@
 {
   "name": "@kuiperdb/client",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "TypeScript/JavaScript client for KuiperDb - a vector database with document relations",
   "type": "module",
   "main": "dist/index.js",

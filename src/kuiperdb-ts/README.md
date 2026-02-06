@@ -5,15 +5,15 @@ A TypeScript/JavaScript client library for KuiperDb - a vector database with doc
 ## Installation
 
 ```bash
-npm install KuiperDb
+npm install @kuiperdb/client
 # or
-yarn add KuiperDb
+yarn add @kuiperdb/client
 ```
 
 ## Quick Start
 
 ```typescript
-import { createClient } from 'KuiperDb';
+import { createClient } from '@kuiperdb/client';
 
 const client = createClient({
   baseURL: 'http://localhost:8080',
@@ -46,4 +46,4 @@ const graph = await client.graphTraverse('my_db', {
 });
 ```
 
-See full documentation at [https://github.com/tsharp/KuiperDb](https://github.com/tsharp/KuiperDb)
+See full documentation at [https://github.com/kuipersys/kuiperdb](https://github.com/kuipersys/kuiperdb)
