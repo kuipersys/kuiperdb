@@ -10,7 +10,7 @@ import ReactFlow, {
 } from 'reactflow';
 import 'reactflow/dist/style.css';
 import { Box, Text, Loader, Center } from '@mantine/core';
-import { KuiperDbClient } from '../api/client';
+import { kuiperdbClient } from '../api/client';
 
 interface GraphViewProps {
   dbName: string;
@@ -48,7 +48,7 @@ export function GraphView({ dbName }: GraphViewProps) {
     try {
       // Get graph statistics to find all nodes
       console.log('GraphView: Loading graph for database:', dbName);
-      const stats = await KuiperDbClient.getGraphStats(dbName);
+      const stats = await kuiperdbClient.getGraphStats(dbName);
       console.log('GraphView: Graph stats:', stats);
       
       // Get all document IDs from the stats
@@ -73,11 +73,11 @@ export function GraphView({ dbName }: GraphViewProps) {
       // For each document, get its details and relations
       const docPromises = Array.from(allDocIds).map(async (docId) => {
         // We need to find which table this document belongs to
-        const tables = await KuiperDbClient.getTables(dbName);
+        const tables = await kuiperdbClient.getTables(dbName);
         
         for (const table of tables) {
           try {
-            const docs = await KuiperDbClient.getDocuments(dbName, table.name);
+            const docs = await kuiperdbClient.getDocuments(dbName, table.name);
             const doc = docs.find((d: Document) => d.id === docId);
             if (doc) {
               return { id: docId, doc, table: table.name };
@@ -97,7 +97,7 @@ export function GraphView({ dbName }: GraphViewProps) {
       const allRelations: DocumentRelation[] = [];
       for (const docId of Array.from(allDocIds)) {
         try {
-          const relations = await KuiperDbClient.getDocumentRelations(dbName, docId);
+          const relations = await kuiperdbClient.getDocumentRelations(dbName, docId);
           console.log(`GraphView: Relations for ${docId}:`, relations);
           for (const rel of relations) {
             // Only add each relation once (check if already added from other direction)

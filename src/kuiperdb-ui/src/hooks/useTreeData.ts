@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { type TreeNode } from '../types';
-import { KuiperDbClient } from '../api/client';
+import { kuiperdbClient, type Database } from '../api/client';
 
 export function useTreeData() {
   const [treeData, setTreeData] = useState<TreeNode[]>([]);
@@ -11,8 +11,8 @@ export function useTreeData() {
     setLoading(true);
     setError(null);
     try {
-      const databases = await KuiperDbClient.getDatabases();
-      const nodes: TreeNode[] = databases.map(db => ({
+      const databases = await kuiperdbClient.getDatabases();
+      const nodes: TreeNode[] = databases.map((db: Database) => ({
         id: `db-${db.name}`,
         label: db.name,
         type: 'database' as const,

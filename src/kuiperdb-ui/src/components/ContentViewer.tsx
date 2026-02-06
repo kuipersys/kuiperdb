@@ -2,7 +2,7 @@ import { Paper, Title, Text, Box, ScrollArea, Badge, Group, Stack, Code } from '
 import { IconCheck, IconX } from '@tabler/icons-react';
 import type { Document } from '../api/client';
 import { useEffect, useState } from 'react';
-import { KuiperDbClient } from '../api/client';
+import { kuiperdbClient } from '../api/client';
 import type { TreeNode } from '../types/index';
 
 interface ContentViewerProps {
@@ -16,7 +16,7 @@ export function ContentViewer({ selectedNode }: ContentViewerProps) {
   useEffect(() => {
     if (selectedNode?.type === 'document' && selectedNode.dbName && selectedNode.tableName && selectedNode.docId) {
       setLoading(true);
-      KuiperDbClient
+      kuiperdbClient
         .getDocument(selectedNode.dbName, selectedNode.tableName, selectedNode.docId)
         .then(setDocument)
         .catch(console.error)
