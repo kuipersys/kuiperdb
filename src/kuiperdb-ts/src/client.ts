@@ -16,7 +16,7 @@ import type {
   CreateRelationRequest,
   StoreDocumentRequest,
   KuiperDbClientConfig,
-} from './types';
+} from './types.js';
 
 export class KuiperDbClient {
   private api: AxiosInstance;

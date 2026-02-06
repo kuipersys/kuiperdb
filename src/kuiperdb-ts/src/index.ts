@@ -5,7 +5,7 @@
  * a vector database with document relations and graph capabilities.
  */
 
-export { KuiperDbClient, createClient } from './client';
+export { KuiperDbClient, createClient } from './client.js';
 export type {
   Document,
   DocumentRelation,
@@ -19,4 +19,4 @@ export type {
   CreateRelationRequest,
   StoreDocumentRequest,
   KuiperDbClientConfig,
-} from './types';
+} from './types.js';

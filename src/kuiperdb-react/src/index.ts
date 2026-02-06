@@ -4,4 +4,4 @@
  * Provides React bindings for the KuiperDb TypeScript client.
  */
 
-export { KuiperDbProvider, useKuiperDb } from './KuiperDbProvider';
+export { KuiperDbProvider, useKuiperDb } from './KuiperDbProvider.js';
