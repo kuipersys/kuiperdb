@@ -22,7 +22,7 @@ interface DocumentRelation {
   target_id: string;
   relation_type: string;
   metadata?: Record<string, any>;
-  created_at: string;
+  created_at: number;
 }
 
 interface Document {

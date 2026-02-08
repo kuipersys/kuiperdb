@@ -9,11 +9,10 @@ export interface Document {
   content: string;
   metadata: Record<string, any>;
   tags: string[];
-  vector?: number[];
   parent_id?: string | null;
   chunk_index?: number;
-  created_at: string;
-  updated_at: string;
+  created_at: number;
+  updated_at: number;
   token_count?: number;
   is_vectorized: boolean;
 }
@@ -24,7 +23,7 @@ export interface DocumentRelation {
   target_id: string;
   relation_type: string;
   metadata: Record<string, any>;
-  created_at: string;
+  created_at: number;
 }
 
 export interface Database {

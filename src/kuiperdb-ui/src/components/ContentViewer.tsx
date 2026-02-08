@@ -118,15 +118,6 @@ export function ContentViewer({ selectedNode }: ContentViewerProps) {
                 <Text size="sm">Updated: {new Date(document.updated_at).toLocaleString()}</Text>
               </Stack>
             </Box>
-
-            {document.vector && (
-              <Box>
-                <Text size="sm" fw={600} mb={4}>Vector Embedding</Text>
-                <Text size="sm" c="dimmed">
-                  Dimension: {document.vector.length}
-                </Text>
-              </Box>
-            )}
           </Stack>
         ) : selectedNode.type === 'database' ? (
           <Text c="dimmed">Database information will be displayed here</Text>

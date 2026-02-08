@@ -1,6 +1,25 @@
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
+
+// Serialize DateTime<Utc> as Unix timestamp in milliseconds
+fn serialize_datetime_as_millis<S>(dt: &DateTime<Utc>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_i64(dt.timestamp_millis())
+}
+
+// Deserialize Unix timestamp in milliseconds to DateTime<Utc>
+fn deserialize_datetime_from_millis<'de, D>(deserializer: D) -> Result<DateTime<Utc>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::Error;
+    let millis = i64::deserialize(deserializer)?;
+    DateTime::from_timestamp_millis(millis)
+        .ok_or_else(|| Error::custom(format!("invalid timestamp: {}", millis)))
+}
 
 /// Document represents a stored document with metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -13,9 +32,17 @@ pub struct Document {
     pub metadata: HashMap<String, serde_json::Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip)]
     pub vector: Option<Vec<f32>>,
+    #[serde(
+        serialize_with = "serialize_datetime_as_millis",
+        deserialize_with = "deserialize_datetime_from_millis"
+    )]
     pub created_at: DateTime<Utc>,
+    #[serde(
+        serialize_with = "serialize_datetime_as_millis",
+        deserialize_with = "deserialize_datetime_from_millis"
+    )]
     pub updated_at: DateTime<Utc>,
     pub is_embedded: bool,
 
@@ -96,7 +123,9 @@ pub struct DBInfo {
     pub name: String,
     pub document_count: i64,
     pub embedded_count: i64,
+    #[serde(serialize_with = "serialize_datetime_as_millis")]
     pub created_at: DateTime<Utc>,
+    #[serde(serialize_with = "serialize_datetime_as_millis")]
     pub last_updated: DateTime<Utc>,
     pub size_bytes: i64,
 }
@@ -118,6 +147,10 @@ pub struct DocumentRelation {
     pub relation_type: String,
     #[serde(default)]
     pub metadata: HashMap<String, serde_json::Value>,
+    #[serde(
+        serialize_with = "serialize_datetime_as_millis",
+        deserialize_with = "deserialize_datetime_from_millis"
+    )]
     pub created_at: DateTime<Utc>,
 }
 
@@ -143,4 +176,59 @@ pub struct GraphTraversalRequest {
 
 fn default_depth() -> usize {
     3
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_timestamp_serialization() {
+        let doc = Document {
+            id: "test-123".to_string(),
+            db: "test_db".to_string(),
+            table: "test_table".to_string(),
+            content: "Test content".to_string(),
+            metadata: HashMap::new(),
+            tags: vec!["test".to_string()],
+            vector: Some(vec![0.1, 0.2, 0.3]),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            is_embedded: true,
+            vectorize: true,
+            is_chunk: false,
+            parent_id: None,
+            chunk_index: None,
+            token_count: Some(10),
+            is_vectorized: true,
+        };
+
+        let json = serde_json::to_string(&doc).expect("Failed to serialize");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("Failed to parse");
+        
+        // Verify timestamps are numbers (milliseconds)
+        assert!(value["created_at"].is_number(), "created_at should be a number");
+        assert!(value["updated_at"].is_number(), "updated_at should be a number");
+        
+        // Verify vector is not serialized
+        assert!(value.get("vector").is_none(), "vector should not be serialized");
+    }
+
+    #[test]
+    fn test_relation_timestamp_serialization() {
+        let relation = DocumentRelation {
+            id: "rel-123".to_string(),
+            source_id: "doc-1".to_string(),
+            target_id: "doc-2".to_string(),
+            relation_type: "related_to".to_string(),
+            metadata: HashMap::new(),
+            created_at: Utc::now(),
+        };
+
+        let json = serde_json::to_string(&relation).expect("Failed to serialize");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("Failed to parse");
+        
+        // Verify timestamp is a number (milliseconds)
+        assert!(value["created_at"].is_number(), "created_at should be a number");
+    }
 }
