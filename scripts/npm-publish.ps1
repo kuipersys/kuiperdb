@@ -146,7 +146,8 @@ function Test-NpmAuth {
             $confirm = Read-Host "  Continue anyway? (yes/no)"
             return ($confirm -eq 'yes')
         }
-    } catch {
+    }
+    catch {
         Write-Error "Failed to check npm authentication: $_"
         return $false
     }
