@@ -11,8 +11,15 @@ pub struct Client {
 
 #[derive(Serialize)]
 struct AddDocumentRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
     content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     metadata: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tags: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vectorize: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -36,8 +43,27 @@ impl Client {
         content: String,
         metadata: Option<serde_json::Value>,
     ) -> Result<String> {
+        self.add_document_with_options(None, content, metadata, None, None)
+            .await
+    }
+
+    /// Add a document with full options including custom ID
+    pub async fn add_document_with_options(
+        &self,
+        id: Option<String>,
+        content: String,
+        metadata: Option<serde_json::Value>,
+        tags: Option<Vec<String>>,
+        vectorize: Option<bool>,
+    ) -> Result<String> {
         let url = format!("{}/documents", self.base_url);
-        let req = AddDocumentRequest { content, metadata };
+        let req = AddDocumentRequest {
+            id,
+            content,
+            metadata,
+            tags,
+            vectorize,
+        };
 
         let response = self.client.post(&url).json(&req).send().await?;
 
