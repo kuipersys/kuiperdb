@@ -14,16 +14,33 @@ export function ContentViewer({ selectedNode }: ContentViewerProps) {
   const [loading, setLoading] = useState(false);
 
   useEffect(() => {
-    if (selectedNode?.type === 'document' && selectedNode.dbName && selectedNode.tableName && selectedNode.docId) {
-      setLoading(true);
-      kuiperdbClient
-        .getDocument(selectedNode.dbName, selectedNode.tableName, selectedNode.docId)
-        .then(setDocument)
-        .catch(console.error)
-        .finally(() => setLoading(false));
-    } else {
-      setDocument(null);
-    }
+    let cancelled = false;
+
+    const loadDocument = async () => {
+      if (selectedNode?.type === 'document' && selectedNode.dbName && selectedNode.tableName && selectedNode.docId) {
+        setLoading(true);
+        try {
+          const nextDocument = await kuiperdbClient.getDocument(selectedNode.dbName, selectedNode.tableName, selectedNode.docId);
+          if (!cancelled) {
+            setDocument(nextDocument);
+          }
+        } catch (error) {
+          console.error(error);
+        } finally {
+          if (!cancelled) {
+            setLoading(false);
+          }
+        }
+      } else {
+        setDocument(null);
+      }
+    };
+
+    loadDocument();
+
+    return () => {
+      cancelled = true;
+    };
   }, [selectedNode]);
 
   if (!selectedNode) {

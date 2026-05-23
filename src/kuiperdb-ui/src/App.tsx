@@ -8,18 +8,37 @@ import { useState, useEffect } from 'react';
 import { TreeView } from './components/TreeView';
 import { ContentViewer } from './components/ContentViewer';
 import { GraphView } from './components/GraphView';
+import { RecordManager } from './components/RecordManager';
 import type { TreeNode } from './types/index';
 import { kuiperdbClient, type Document } from './api/client';
-import { IconAlertCircle, IconRefresh, IconFileText, IconNetwork } from '@tabler/icons-react';
+import { IconAlertCircle, IconRefresh, IconFileText, IconNetwork, IconDatabaseSearch } from '@tabler/icons-react';
 
 const queryClient = new QueryClient();
+
+function getErrorMessage(error: unknown): string {
+  if (typeof error === 'object' && error !== null) {
+    const maybeError = error as {
+      response?: { data?: { message?: string; error?: string } };
+      message?: string;
+    };
+
+    return (
+      maybeError.response?.data?.message ||
+      maybeError.response?.data?.error ||
+      maybeError.message ||
+      'Request failed'
+    );
+  }
+
+  return 'Request failed';
+}
 
 function AppContent() {
   const [treeData, setTreeData] = useState<TreeNode[]>([]);
   const [selectedNode, setSelectedNode] = useState<TreeNode | null>(null);
   const [loading, setLoading] = useState(false);
   const [healthStatus, setHealthStatus] = useState<boolean | null>(null);
-  const [activeTab, setActiveTab] = useState<string>('content');
+  const [activeTab, setActiveTab] = useState<string>('records');
 
   const checkHealth = async () => {
     const healthy = await kuiperdbClient.healthCheck();
@@ -138,6 +157,140 @@ function AppContent() {
     setSelectedNode(node);
   };
 
+  const createDocumentNode = (dbName: string, tableName: string, docId: string): TreeNode => ({
+    id: `doc-${docId}`,
+    label: docId.length > 12 ? `${docId.substring(0, 12)}...` : docId,
+    type: 'document' as const,
+    dbName,
+    tableName,
+    docId,
+    hasChildren: true,
+    children: [],
+  });
+
+  const createTableNode = (dbName: string, tableName: string, children: TreeNode[] = []): TreeNode => ({
+    id: `table-${dbName}-${tableName}`,
+    label: tableName,
+    type: 'table' as const,
+    dbName,
+    tableName,
+    hasChildren: true,
+    children,
+  });
+
+  const createDatabaseNode = (dbName: string, children: TreeNode[] = []): TreeNode => ({
+    id: `db-${dbName}`,
+    label: dbName,
+    type: 'database' as const,
+    dbName,
+    hasChildren: true,
+    children,
+  });
+
+  const handleRecordSelected = (dbName: string, tableName: string, docId: string) => {
+    setSelectedNode(createDocumentNode(dbName, tableName, docId));
+    setActiveTab('content');
+  };
+
+  const handleRecordCreated = (document: Document) => {
+    const docNode = createDocumentNode(document.db, document.table, document.id);
+
+    setTreeData(prevData => {
+      let foundDb = false;
+      const nextData = prevData.map(db => {
+        if (db.dbName !== document.db) {
+          return db;
+        }
+
+        foundDb = true;
+        let foundTable = false;
+        const tableChildren = db.children || [];
+        const nextTables = tableChildren.map(table => {
+          if (table.tableName !== document.table) {
+            return table;
+          }
+
+          foundTable = true;
+          const existingDocs = table.children || [];
+          return {
+            ...table,
+            hasChildren: true,
+            children: [
+              docNode,
+              ...existingDocs.filter(doc => doc.docId !== document.id),
+            ],
+          };
+        });
+
+        if (!foundTable) {
+          nextTables.push(createTableNode(document.db, document.table, [docNode]));
+        }
+
+        return {
+          ...db,
+          hasChildren: true,
+          children: nextTables,
+        };
+      });
+
+      if (!foundDb) {
+        return [
+          ...nextData,
+          createDatabaseNode(document.db, [
+            createTableNode(document.db, document.table, [docNode]),
+          ]),
+        ];
+      }
+
+      return nextData;
+    });
+
+    setSelectedNode(docNode);
+    setActiveTab('content');
+  };
+
+  const handleSchemaChanged = (dbName: string, tableName?: string) => {
+    const nextSelectedNode = tableName
+      ? createTableNode(dbName, tableName)
+      : createDatabaseNode(dbName);
+
+    setTreeData(prevData => {
+      let foundDb = false;
+      const nextData = prevData.map(db => {
+        if (db.dbName !== dbName) {
+          return db;
+        }
+
+        foundDb = true;
+        if (!tableName) {
+          return db;
+        }
+
+        const tableChildren = db.children || [];
+        const hasTable = tableChildren.some(table => table.tableName === tableName);
+
+        return {
+          ...db,
+          hasChildren: true,
+          children: hasTable
+            ? tableChildren
+            : [...tableChildren, createTableNode(dbName, tableName)],
+        };
+      });
+
+      if (!foundDb) {
+        return [
+          ...nextData,
+          createDatabaseNode(dbName, tableName ? [createTableNode(dbName, tableName)] : []),
+        ];
+      }
+
+      return nextData;
+    });
+
+    setSelectedNode(nextSelectedNode);
+  };
+
   const handleDelete = async (node: TreeNode) => {
     const confirmMessage = node.type === 'database'
       ? `Delete database "${node.label}" and ALL its tables and documents? This cannot be undone!`
@@ -208,10 +361,10 @@ function AppContent() {
               setSelectedNode(null);
             }
           }
-        } catch (err: any) {
+        } catch (err) {
           notifications.show({
             title: 'Delete failed',
-            message: err.response?.data?.message || err.message || 'Failed to delete',
+            message: getErrorMessage(err),
             color: 'red',
           });
         }
@@ -265,6 +418,9 @@ function AppContent() {
             <Grid.Col span={8} h="100%">
               <Tabs value={activeTab} onChange={(value) => setActiveTab(value || 'content')} h="100%">
                 <Tabs.List>
+                  <Tabs.Tab value="records" leftSection={<IconDatabaseSearch size={16} />}>
+                    Records
+                  </Tabs.Tab>
                   <Tabs.Tab value="content" leftSection={<IconFileText size={16} />}>
                     Content
                   </Tabs.Tab>
@@ -276,6 +432,15 @@ function AppContent() {
                     Graph
                   </Tabs.Tab>
                 </Tabs.List>
+
+                <Tabs.Panel value="records" h="calc(100% - 40px)" pt="xs">
+                  <RecordManager
+                    selectedNode={selectedNode}
+                    onRecordCreated={handleRecordCreated}
+                    onRecordSelected={handleRecordSelected}
+                    onSchemaChanged={handleSchemaChanged}
+                  />
+                </Tabs.Panel>
 
                 <Tabs.Panel value="content" h="calc(100% - 40px)" pt="xs">
                   <ContentViewer selectedNode={selectedNode} />

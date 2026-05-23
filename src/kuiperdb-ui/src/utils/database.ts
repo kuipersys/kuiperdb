@@ -1,4 +1,4 @@
-import { type Database, type Table } from '../api/client';
+import { type Database, type Document, type Table } from '../api/client';
 import { type TreeNode } from '../types';
 
 // Since the API doesn't fully support listing databases/tables yet,
@@ -11,7 +11,8 @@ export async function scanDataDirectory(): Promise<Database[]> {
   return [];
 }
 
-export async function getDatabaseTables(_dbName: string): Promise<Table[]> {
+export async function getDatabaseTables(dbName: string): Promise<Table[]> {
+  void dbName;
   // This would need a backend API endpoint
   // For now, we'll simulate with known tables
   return [];
@@ -29,7 +30,7 @@ export function createTreeFromDatabases(databases: Database[]): TreeNode[] {
 }
 
 export function createDocumentNode(
-  doc: any,
+  doc: Pick<Document, 'id' | 'parent_id'>,
   dbName: string,
   tableName: string
 ): TreeNode {

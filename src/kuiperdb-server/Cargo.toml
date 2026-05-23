@@ -21,7 +21,7 @@ kuiperdb-core = { path = "../kuiperdb-core" }
 tokio.workspace = true
 
 # HTTP server
-actix-web = "4.9"
+actix-web = "4.13"
 actix-cors = "0.7"
 actix-files = "0.6"
 
@@ -30,7 +30,7 @@ serde.workspace = true
 serde_json.workspace = true
 
 # Database
-sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "chrono"] }
+sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite", "chrono"] }
 
 # Error handling
 anyhow.workspace = true

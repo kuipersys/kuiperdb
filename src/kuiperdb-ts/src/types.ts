@@ -36,14 +36,23 @@ export interface Table {
 
 export interface SearchRequest {
   query: string;
+  type?: 'vector' | 'fulltext' | 'hybrid';
   limit?: number;
-  threshold?: number;
-  include_metadata?: boolean;
+  filters?: Record<string, any>;
+  include_chunks?: boolean;
+  group_by_parent?: boolean;
 }
 
 export interface SearchResult {
-  document: Document;
+  id: string;
+  content: string;
+  metadata: Record<string, any>;
   score: number;
+  fts_rank?: number | null;
+  vector_similarity?: number | null;
+  is_chunk: boolean;
+  parent_id?: string | null;
+  chunk_index?: number | null;
 }
 
 export interface GraphTraversalRequest {
@@ -74,10 +83,15 @@ export interface CreateRelationRequest {
 }
 
 export interface StoreDocumentRequest {
+  id?: string;
   content: string;
   metadata?: Record<string, any>;
   tags?: string[];
-  parent_id?: string | null;
+  vectorize?: boolean;
+}
+
+export interface StoreDocumentOptions {
+  asyncEmbedding?: boolean;
 }
 
 export interface KuiperDbClientConfig {

@@ -121,7 +121,9 @@ impl DocumentStore {
             table_name, table_name
         );
 
-        sqlx::query(&create_table).execute(pool).await?;
+        sqlx::query(sqlx::AssertSqlSafe(create_table))
+            .execute(pool)
+            .await?;
 
         // Create FTS5 virtual table
         let create_fts = format!(
@@ -136,7 +138,9 @@ impl DocumentStore {
             table_name, table_name
         );
 
-        sqlx::query(&create_fts).execute(pool).await?;
+        sqlx::query(sqlx::AssertSqlSafe(create_fts))
+            .execute(pool)
+            .await?;
 
         // Create triggers - re-get pool to work around borrow checker
         self.create_fts_triggers_for_table(db_id, table_name)
@@ -168,7 +172,9 @@ impl DocumentStore {
         ];
 
         for index_sql in indexes {
-            sqlx::query(&index_sql).execute(pool).await?;
+            sqlx::query(sqlx::AssertSqlSafe(index_sql))
+                .execute(pool)
+                .await?;
         }
 
         // Create document_relations table (shared for all tables in this db)
@@ -188,12 +194,11 @@ impl DocumentStore {
         }
 
         let pool = self.get_pool(db_id).await?;
-        let row = sqlx::query(
-            r#"SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?"#,
-        )
-        .bind(table_name)
-        .fetch_optional(pool)
-        .await?;
+        let row =
+            sqlx::query(r#"SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?"#)
+                .bind(table_name)
+                .fetch_optional(pool)
+                .await?;
 
         Ok(row.is_some())
     }
@@ -286,9 +291,15 @@ impl DocumentStore {
             table_name, table_name, table_name
         );
 
-        sqlx::query(&insert_trigger).execute(pool).await?;
-        sqlx::query(&delete_trigger).execute(pool).await?;
-        sqlx::query(&update_trigger).execute(pool).await?;
+        sqlx::query(sqlx::AssertSqlSafe(insert_trigger))
+            .execute(pool)
+            .await?;
+        sqlx::query(sqlx::AssertSqlSafe(delete_trigger))
+            .execute(pool)
+            .await?;
+        sqlx::query(sqlx::AssertSqlSafe(update_trigger))
+            .execute(pool)
+            .await?;
 
         Ok(())
     }
@@ -317,9 +328,9 @@ impl DocumentStore {
         };
 
         // Calculate token count if not already set (estimate: 1 token per 4 characters)
-        let token_count = doc.token_count.unwrap_or_else(|| {
-            (doc.content.len() as f32 / 4.0).ceil() as i32
-        });
+        let token_count = doc
+            .token_count
+            .unwrap_or_else(|| (doc.content.len() as f32 / 4.0).ceil() as i32);
 
         let query = format!(
             r#"
@@ -342,7 +353,7 @@ impl DocumentStore {
             table_name
         );
 
-        sqlx::query(&query)
+        sqlx::query(sqlx::AssertSqlSafe(query))
             .bind(&doc.id)
             .bind(&doc.content)
             .bind(&metadata_json)
@@ -382,7 +393,7 @@ impl DocumentStore {
             table_name
         );
 
-        let row = sqlx::query(&query)
+        let row = sqlx::query(sqlx::AssertSqlSafe(query))
             .bind(id)
             .fetch_one(pool)
             .await
@@ -447,7 +458,10 @@ impl DocumentStore {
             table_name
         );
 
-        let rows = sqlx::query(&query).bind(limit).fetch_all(pool).await?;
+        let rows = sqlx::query(sqlx::AssertSqlSafe(query))
+            .bind(limit)
+            .fetch_all(pool)
+            .await?;
 
         let mut documents = Vec::new();
         for row in rows {
@@ -508,7 +522,10 @@ impl DocumentStore {
             table_name
         );
 
-        let rows = sqlx::query(&query).bind(limit).fetch_all(pool).await?;
+        let rows = sqlx::query(sqlx::AssertSqlSafe(query))
+            .bind(limit)
+            .fetch_all(pool)
+            .await?;
 
         let mut documents = Vec::new();
         for row in rows {
@@ -574,7 +591,7 @@ impl DocumentStore {
             table_name
         );
 
-        sqlx::query(&query)
+        sqlx::query(sqlx::AssertSqlSafe(query))
             .bind(&vector_bytes)
             .bind(Utc::now())
             .bind(doc_id)
@@ -607,7 +624,9 @@ impl DocumentStore {
             table_name
         );
 
-        let rows = sqlx::query(&sql).fetch_all(pool).await?;
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .fetch_all(pool)
+            .await?;
 
         if rows.is_empty() {
             tracing::warn!("No vectors to index for {}.{}", db_id, table_name);
@@ -642,7 +661,7 @@ impl DocumentStore {
 
     /// List all databases
     pub async fn list_databases(&self) -> Result<Vec<String>> {
-        let data_dir = Path::new("data");
+        let data_dir = Path::new(&self.base_dir);
         let mut databases = Vec::new();
 
         if !data_dir.exists() {
@@ -731,7 +750,7 @@ impl DocumentStore {
             table_name
         );
 
-        let rows = sqlx::query(&sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(query)
             .bind(limit as i64)
             .fetch_all(pool)
@@ -812,7 +831,9 @@ impl DocumentStore {
             table_name
         );
 
-        let row = sqlx::query(&count_query).fetch_one(pool).await?;
+        let row = sqlx::query(sqlx::AssertSqlSafe(count_query))
+            .fetch_one(pool)
+            .await?;
         let count: i64 = row.get("count");
 
         Ok(count as usize >= self.index_threshold)
@@ -864,7 +885,11 @@ impl DocumentStore {
                 table_name
             );
 
-            if let Ok(row) = sqlx::query(&query).bind(&doc_id).fetch_one(pool).await {
+            if let Ok(row) = sqlx::query(sqlx::AssertSqlSafe(query))
+                .bind(&doc_id)
+                .fetch_one(pool)
+                .await
+            {
                 let content: String = row.get("content");
                 let metadata_json: String = row.get("metadata");
                 let metadata: HashMap<String, serde_json::Value> =
@@ -918,7 +943,9 @@ impl DocumentStore {
             table_name
         );
 
-        let rows = sqlx::query(&sql).fetch_all(pool).await?;
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .fetch_all(pool)
+            .await?;
 
         let mut results = Vec::new();
         for row in rows {
@@ -1129,7 +1156,10 @@ impl DocumentStore {
             table_name
         );
 
-        let rows = sqlx::query(&query).bind(parent_id).fetch_all(pool).await?;
+        let rows = sqlx::query(sqlx::AssertSqlSafe(query))
+            .bind(parent_id)
+            .fetch_all(pool)
+            .await?;
 
         let mut documents = Vec::new();
         for row in rows {
@@ -1191,7 +1221,10 @@ impl DocumentStore {
             table_name
         );
 
-        sqlx::query(&query).bind(parent_id).execute(pool).await?;
+        sqlx::query(sqlx::AssertSqlSafe(query))
+            .bind(parent_id)
+            .execute(pool)
+            .await?;
 
         Ok(())
     }
@@ -1258,16 +1291,13 @@ impl DocumentStore {
         let pool = self.get_pool(db_id).await?;
 
         // First, check if this is a child document (has parent_id)
-        let check_query = format!(
-            r#"SELECT parent_id FROM "{}" WHERE id = ?"#,
-            table_name
-        );
-        
-        let result: Option<(Option<String>,)> = sqlx::query_as(&check_query)
+        let check_query = format!(r#"SELECT parent_id FROM "{}" WHERE id = ?"#, table_name);
+
+        let result: Option<(Option<String>,)> = sqlx::query_as(sqlx::AssertSqlSafe(check_query))
             .bind(doc_id)
             .fetch_optional(pool)
             .await?;
-        
+
         if let Some((Some(_parent_id),)) = result {
             return Err(anyhow::anyhow!(
                 "Cannot delete child document. Delete the parent document instead, which will cascade delete all children."
@@ -1277,7 +1307,10 @@ impl DocumentStore {
         // Document is a parent or standalone - proceed with deletion
         // CASCADE will automatically delete children
         let query = format!(r#"DELETE FROM "{}" WHERE id = ?"#, table_name);
-        sqlx::query(&query).bind(doc_id).execute(pool).await?;
+        sqlx::query(sqlx::AssertSqlSafe(query))
+            .bind(doc_id)
+            .execute(pool)
+            .await?;
 
         Ok(())
     }
@@ -1291,11 +1324,15 @@ impl DocumentStore {
 
         // Drop the main table
         let drop_table = format!(r#"DROP TABLE IF EXISTS "{}""#, table_name);
-        sqlx::query(&drop_table).execute(pool).await?;
+        sqlx::query(sqlx::AssertSqlSafe(drop_table))
+            .execute(pool)
+            .await?;
 
         // Drop the FTS table
         let drop_fts = format!(r#"DROP TABLE IF EXISTS "{}_fts""#, table_name);
-        sqlx::query(&drop_fts).execute(pool).await?;
+        sqlx::query(sqlx::AssertSqlSafe(drop_fts))
+            .execute(pool)
+            .await?;
 
         Ok(())
     }
@@ -1307,8 +1344,7 @@ impl DocumentStore {
         // Delete the database file
         let db_path = format!("{}/{}.db", self.base_dir, db_id);
         if std::path::Path::new(&db_path).exists() {
-            std::fs::remove_file(&db_path)
-                .context("Failed to delete database file")?;
+            std::fs::remove_file(&db_path).context("Failed to delete database file")?;
         }
 
         Ok(())

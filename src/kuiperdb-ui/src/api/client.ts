@@ -7,6 +7,7 @@
  */
 
 import { createClient } from '@kuiperdb/client';
+import type { SearchRequest, StoreDocumentRequest } from '@kuiperdb/client';
 
 // Re-export types from @kuiperdb/client
 export type {
@@ -21,6 +22,7 @@ export type {
   GraphStatistics,
   CreateRelationRequest,
   StoreDocumentRequest,
+  StoreDocumentOptions,
 } from '@kuiperdb/client';
 
 // Create a default client instance for backwards compatibility
@@ -29,9 +31,13 @@ const defaultClient = createClient({ baseURL: '/' });
 // Export legacy client interface
 export const kuiperdbClient = {
   getDatabases: () => defaultClient.getDatabases(),
+  createDatabase: (dbName: string) => defaultClient.createDatabase(dbName),
   getTables: (dbName: string) => defaultClient.getTables(dbName),
+  createTable: (dbName: string, tableName: string) => defaultClient.createTable(dbName, tableName),
   getDocuments: (dbName: string, tableName: string) => defaultClient.getDocuments(dbName, tableName),
   getDocument: (dbName: string, tableName: string, docId: string) => defaultClient.getDocument(dbName, tableName, docId),
+  storeDocument: (dbName: string, tableName: string, document: StoreDocumentRequest) => defaultClient.storeDocument(dbName, tableName, document, { asyncEmbedding: true }),
+  search: (dbName: string, tableName: string, request: SearchRequest) => defaultClient.search(dbName, tableName, request),
   getDocumentRelations: (dbName: string, docId: string) => defaultClient.getDocumentRelations(dbName, docId),
   healthCheck: () => defaultClient.healthCheck(),
   getChunks: (dbName: string, tableName: string, docId: string) => defaultClient.getChunks(dbName, tableName, docId),

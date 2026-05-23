@@ -11,7 +11,7 @@ tokio.workspace = true
 async-trait = "0.1"
 
 # Database
-sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "chrono"] }
+sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite", "chrono"] }
 
 # Serialization
 serde.workspace = true
@@ -29,22 +29,22 @@ chrono.workspace = true
 uuid.workspace = true
 
 # Caching
-lru = "0.12"
-sha2 = "0.10"
+lru = "0.18"
+sha2 = "0.11"
 hex = "0.4"
 
 # Vector index (HNSW)
 hnsw_rs = "0.3"
 
 # Parallel processing
-rayon = "1.10"
+rayon = "1.12"
 futures = "0.3"
 
 # Tokenization for chunking
-tiktoken-rs = "0.5"
+tiktoken-rs = "0.11"
 
 # Graph algorithms
-petgraph = "0.6"
+petgraph = "0.8"
 
 # HTTP client for embeddings
-reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+reqwest = { version = "0.13", features = ["json", "rustls"], default-features = false }

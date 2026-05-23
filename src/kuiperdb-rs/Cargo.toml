@@ -13,7 +13,7 @@ kuiperdb-core = { path = "../kuiperdb-core" }
 tokio.workspace = true
 
 # HTTP client
-reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+reqwest = { version = "0.13", features = ["json", "rustls"], default-features = false }
 
 # Serialization
 serde.workspace = true

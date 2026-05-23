@@ -21,7 +21,7 @@ interface DocumentRelation {
   source_id: string;
   target_id: string;
   relation_type: string;
-  metadata?: Record<string, any>;
+  metadata?: Record<string, unknown>;
   created_at: number;
 }
 
@@ -82,7 +82,7 @@ export function GraphView({ dbName }: GraphViewProps) {
             if (doc) {
               return { id: docId, doc, table: table.name };
             }
-          } catch (e) {
+          } catch {
             // Table might not exist or have no documents
             continue;
           }

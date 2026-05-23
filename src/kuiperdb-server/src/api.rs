@@ -53,6 +53,98 @@ pub struct LogCleanupRequest {
     pub days_to_keep: Option<u32>,
 }
 
+/// Request body for creating a database
+#[derive(Deserialize)]
+pub struct CreateDatabaseRequest {
+    pub name: String,
+}
+
+/// Request body for creating a table
+#[derive(Deserialize)]
+pub struct CreateTableRequest {
+    pub name: String,
+}
+
+fn is_valid_resource_name(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Create a database
+/// POST /db
+pub async fn create_database(
+    req: web::Json<CreateDatabaseRequest>,
+    state: web::Data<AppState>,
+) -> ActixResult<HttpResponse> {
+    let db_name = req.name.trim();
+
+    if !is_valid_resource_name(db_name) {
+        return Ok(HttpResponse::BadRequest().json(ErrorResponse {
+            error: "invalid database name".to_string(),
+            message: Some(
+                "database names may contain only letters, numbers, and underscores".to_string(),
+            ),
+        }));
+    }
+
+    let mut store = state.store.lock().await;
+    let existed = store.database_exists(db_name);
+
+    store.get_pool(db_name).await.map_err(|e| {
+        actix_web::error::ErrorInternalServerError(format!("Failed to create database: {}", e))
+    })?;
+
+    let mut response = if existed {
+        HttpResponse::Ok()
+    } else {
+        HttpResponse::Created()
+    };
+
+    Ok(response.json(serde_json::json!({
+        "name": db_name
+    })))
+}
+
+/// Create a table in a database
+/// POST /db/{db_name}/tables
+pub async fn create_table(
+    path: web::Path<String>,
+    req: web::Json<CreateTableRequest>,
+    state: web::Data<AppState>,
+) -> ActixResult<HttpResponse> {
+    let db_name = path.into_inner();
+    let table_name = req.name.trim();
+
+    if !is_valid_resource_name(&db_name) {
+        return Ok(HttpResponse::BadRequest().json(ErrorResponse {
+            error: "invalid database name".to_string(),
+            message: Some(
+                "database names may contain only letters, numbers, and underscores".to_string(),
+            ),
+        }));
+    }
+
+    if !is_valid_resource_name(table_name) {
+        return Ok(HttpResponse::BadRequest().json(ErrorResponse {
+            error: "invalid table name".to_string(),
+            message: Some(
+                "table names may contain only letters, numbers, and underscores".to_string(),
+            ),
+        }));
+    }
+
+    let mut store = state.store.lock().await;
+    store
+        .ensure_table(&db_name, table_name)
+        .await
+        .map_err(|e| {
+            actix_web::error::ErrorInternalServerError(format!("Failed to create table: {}", e))
+        })?;
+
+    Ok(HttpResponse::Created().json(serde_json::json!({
+        "name": table_name
+    })))
+}
+
 /// Store a document
 /// POST /db/{db_name}/{table_name}
 #[tracing::instrument(skip(path, http_req, req, state))]
@@ -84,7 +176,9 @@ pub async fn store_document(
     let table_exists = store
         .table_exists(&db_name, &table_name)
         .await
-        .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Table check failed: {}", e)))?;
+        .map_err(|e| {
+            actix_web::error::ErrorInternalServerError(format!("Table check failed: {}", e))
+        })?;
 
     if !table_exists {
         return Ok(HttpResponse::NotFound().json(ErrorResponse {
@@ -108,7 +202,7 @@ pub async fn store_document(
     };
 
     // Check if sync embedding is requested
-    if state.config.features.embedding {
+    if doc.vectorize && state.config.features.embedding {
         if let Some(embedder) = &state.embedder {
             // Parse X-Client-Features header
             let client_features =
@@ -141,7 +235,7 @@ pub async fn store_document(
 
         // Select chunker based on strategy
         let use_markdown = state.config.chunking.strategy.as_str() == "markdown";
-        
+
         // Count tokens and chunk if needed
         if use_markdown {
             if let Ok(chunker) = MarkdownChunker::new() {
@@ -449,7 +543,7 @@ pub async fn list_databases(state: web::Data<AppState>) -> ActixResult<HttpRespo
     let databases = store.list_databases().await.map_err(|e| {
         actix_web::error::ErrorInternalServerError(format!("Failed to list databases: {}", e))
     })?;
-    
+
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "databases": databases.iter().map(|name| serde_json::json!({"name": name})).collect::<Vec<_>>()
     })))
@@ -474,13 +568,13 @@ pub async fn list_tables(
     let tables = store.list_tables(&db_name).await.map_err(|e| {
         actix_web::error::ErrorInternalServerError(format!("Failed to list tables: {}", e))
     })?;
-    
+
     // Filter out system/internal tables
     let user_tables: Vec<String> = tables
         .into_iter()
         .filter(|name| !name.ends_with("_fts") && name != "document_relations")
         .collect();
-    
+
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "tables": user_tables.iter().map(|name| serde_json::json!({"name": name})).collect::<Vec<_>>()
     })))
@@ -505,7 +599,9 @@ pub async fn list_documents(
     let table_exists = store
         .table_exists(&db_name, &table_name)
         .await
-        .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Table check failed: {}", e)))?;
+        .map_err(|e| {
+            actix_web::error::ErrorInternalServerError(format!("Table check failed: {}", e))
+        })?;
 
     if !table_exists {
         return Ok(HttpResponse::Ok().json(serde_json::json!({
@@ -514,15 +610,20 @@ pub async fn list_documents(
     }
 
     // Get all documents (not just non-embedded ones)
-    let all_docs = store.get_all_documents(&db_name, &table_name, 1000).await
+    let all_docs = store
+        .get_all_documents(&db_name, &table_name, 1000)
+        .await
         .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Query error: {}", e)))?;
-    
+
     // Filter for root documents (no parent_id)
-    let root_docs: Vec<_> = all_docs.into_iter()
-        .filter(|doc| doc.parent_id.is_none() || doc.parent_id.as_ref().map(|s| s.is_empty()).unwrap_or(true))
+    let root_docs: Vec<_> = all_docs
+        .into_iter()
+        .filter(|doc| {
+            doc.parent_id.is_none() || doc.parent_id.as_ref().map(|s| s.is_empty()).unwrap_or(true)
+        })
         .take(100)
         .collect();
-    
+
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "documents": root_docs
     })))
@@ -799,7 +900,9 @@ pub async fn get_chunks(
     let table_exists = store
         .table_exists(&db_name, &table_name)
         .await
-        .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Table check failed: {}", e)))?;
+        .map_err(|e| {
+            actix_web::error::ErrorInternalServerError(format!("Table check failed: {}", e))
+        })?;
 
     if !table_exists {
         return Ok(HttpResponse::NotFound().json(ErrorResponse {
@@ -928,7 +1031,7 @@ pub async fn list_logs() -> ActixResult<HttpResponse> {
                         // rolling-file creates: kuiperdb.log (current) and kuiperdb.log.YYYY-MM-DD (rotated daily)
                         let date: String;
                         let number: u32;
-                        
+
                         if name == "kuiperdb.log" {
                             // Current active log file
                             date = chrono::Utc::now().format("%Y-%m-%d").to_string();
@@ -1162,6 +1265,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.service(
         web::scope("/db")
             .route("", web::get().to(list_databases))
+            .route("", web::post().to(create_database))
             // Specific named routes MUST come before generic patterns
             // Relations endpoints
             .route("/{db_name}/relations", web::post().to(create_relation))
@@ -1183,7 +1287,11 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route("/{db_name}/graph/stats", web::get().to(graph_statistics))
             // Table-specific routes
             .route("/{db_name}/tables", web::get().to(list_tables))
-            .route("/{db_name}/{table_name}/documents", web::get().to(list_documents))
+            .route("/{db_name}/tables", web::post().to(create_table))
+            .route(
+                "/{db_name}/{table_name}/documents",
+                web::get().to(list_documents),
+            )
             .route("/{db_name}/{table_name}/search", web::post().to(search))
             .route(
                 "/{db_name}/{table_name}/{doc_id}/chunks",
@@ -1202,15 +1310,9 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
                 web::delete().to(delete_document),
             )
             .route("/{db_name}/{table_name}", web::post().to(store_document))
-            .route(
-                "/{db_name}/{table_name}",
-                web::delete().to(delete_table),
-            )
+            .route("/{db_name}/{table_name}", web::delete().to(delete_table))
             // Database deletion - MUST be last for /{db_name}
-            .route(
-                "/{db_name}",
-                web::delete().to(delete_database),
-            ),
+            .route("/{db_name}", web::delete().to(delete_database)),
     )
     .service(
         web::scope("/logs")

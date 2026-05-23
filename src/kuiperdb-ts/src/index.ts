@@ -18,5 +18,6 @@ export type {
   GraphStatistics,
   CreateRelationRequest,
   StoreDocumentRequest,
+  StoreDocumentOptions,
   KuiperDbClientConfig,
 } from './types.js';

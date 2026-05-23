@@ -44,7 +44,7 @@ impl Chunker for FixedTokenChunker {
             let chunk_tokens = &tokens[start..end];
 
             // Decode tokens back to text
-            let chunk_text = self.bpe.decode(chunk_tokens.to_vec())?;
+            let chunk_text = self.bpe.decode(chunk_tokens)?;
             chunks.push(chunk_text);
 
             // Move to next chunk with overlap
@@ -133,7 +133,7 @@ impl MarkdownChunker {
             } else {
                 false
             };
-            
+
             if is_hr {
                 // Horizontal rule marks end of section - save current section
                 if !current_section.is_empty() {
@@ -154,7 +154,7 @@ impl MarkdownChunker {
 
         sections
     }
-    
+
     /// Clean section by trimming whitespace and removing empty lines from start/end
     fn clean_section(text: &str) -> String {
         text.trim().to_string()
@@ -177,7 +177,7 @@ impl MarkdownChunker {
                     chunks.push(current_chunk.trim().to_string());
                     current_chunk.clear();
                 }
-                
+
                 // Split large paragraph with fixed token chunker
                 let para_chunks = FixedTokenChunker::new()?.chunk(para, max_tokens, 50)?;
                 chunks.extend(para_chunks);
@@ -215,7 +215,7 @@ impl Chunker for MarkdownChunker {
 
         // Split by markdown sections first
         let sections = self.split_by_sections(text);
-        
+
         let mut chunks = Vec::new();
 
         for (_level, section) in sections {
@@ -259,17 +259,29 @@ mod tests {
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0], text);
     }
-    
+
     #[test]
     fn test_markdown_chunker_splits_by_horizontal_rules() {
         let chunker = MarkdownChunker::new().unwrap();
         let text = "# Title\nSome content\n\n---\n\n## Section\nMore content";
         let chunks = chunker.chunk(text, 512, 0).unwrap();
         assert_eq!(chunks.len(), 2, "Should split into 2 chunks at ---");
-        assert!(chunks[0].contains("Title"), "First chunk should contain title");
-        assert!(chunks[1].contains("Section"), "Second chunk should contain section");
-        assert!(!chunks[0].contains("---"), "Chunks should not contain the delimiter");
-        assert!(!chunks[1].contains("---"), "Chunks should not contain the delimiter");
+        assert!(
+            chunks[0].contains("Title"),
+            "First chunk should contain title"
+        );
+        assert!(
+            chunks[1].contains("Section"),
+            "Second chunk should contain section"
+        );
+        assert!(
+            !chunks[0].contains("---"),
+            "Chunks should not contain the delimiter"
+        );
+        assert!(
+            !chunks[1].contains("---"),
+            "Chunks should not contain the delimiter"
+        );
     }
 
     #[test]

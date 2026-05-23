@@ -44,7 +44,11 @@ fn default_cors_enabled() -> bool {
 }
 
 fn default_allowed_origins() -> Vec<String> {
-    vec!["http://localhost:5173".to_string(), "http://localhost:5174".to_string(), "http://localhost:5175".to_string()]
+    vec![
+        "http://localhost:5173".to_string(),
+        "http://localhost:5174".to_string(),
+        "http://localhost:5175".to_string(),
+    ]
 }
 
 impl Default for CorsConfig {

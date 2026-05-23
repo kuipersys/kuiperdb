@@ -15,6 +15,7 @@ import type {
   GraphStatistics,
   CreateRelationRequest,
   StoreDocumentRequest,
+  StoreDocumentOptions,
   KuiperDbClientConfig,
 } from './types.js';
 
@@ -43,6 +44,14 @@ export class KuiperDbClient {
   }
 
   /**
+   * Create a database
+   */
+  async createDatabase(dbName: string): Promise<Database> {
+    const response = await this.api.post('/db', { name: dbName });
+    return response.data;
+  }
+
+  /**
    * Delete a database
    */
   async deleteDatabase(dbName: string): Promise<void> {
@@ -57,6 +66,14 @@ export class KuiperDbClient {
   async getTables(dbName: string): Promise<Table[]> {
     const response = await this.api.get(`/db/${dbName}/tables`);
     return response.data.tables || [];
+  }
+
+  /**
+   * Create a table in a database
+   */
+  async createTable(dbName: string, tableName: string): Promise<Table> {
+    const response = await this.api.post(`/db/${dbName}/tables`, { name: tableName });
+    return response.data;
   }
 
   /**
@@ -97,9 +114,12 @@ export class KuiperDbClient {
   async storeDocument(
     dbName: string,
     tableName: string,
-    document: StoreDocumentRequest
+    document: StoreDocumentRequest,
+    options?: StoreDocumentOptions
   ): Promise<Document> {
-    const response = await this.api.post(`/db/${dbName}/${tableName}`, document);
+    const response = await this.api.post(`/db/${dbName}/${tableName}`, document, {
+      headers: options?.asyncEmbedding ? { 'X-Client-Features': 'embed=async' } : undefined,
+    });
     return response.data;
   }
 

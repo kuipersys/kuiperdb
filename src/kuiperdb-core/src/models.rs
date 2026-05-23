@@ -205,13 +205,22 @@ mod tests {
 
         let json = serde_json::to_string(&doc).expect("Failed to serialize");
         let value: serde_json::Value = serde_json::from_str(&json).expect("Failed to parse");
-        
+
         // Verify timestamps are numbers (milliseconds)
-        assert!(value["created_at"].is_number(), "created_at should be a number");
-        assert!(value["updated_at"].is_number(), "updated_at should be a number");
-        
+        assert!(
+            value["created_at"].is_number(),
+            "created_at should be a number"
+        );
+        assert!(
+            value["updated_at"].is_number(),
+            "updated_at should be a number"
+        );
+
         // Verify vector is not serialized
-        assert!(value.get("vector").is_none(), "vector should not be serialized");
+        assert!(
+            value.get("vector").is_none(),
+            "vector should not be serialized"
+        );
     }
 
     #[test]
@@ -227,8 +236,11 @@ mod tests {
 
         let json = serde_json::to_string(&relation).expect("Failed to serialize");
         let value: serde_json::Value = serde_json::from_str(&json).expect("Failed to parse");
-        
+
         // Verify timestamp is a number (milliseconds)
-        assert!(value["created_at"].is_number(), "created_at should be a number");
+        assert!(
+            value["created_at"].is_number(),
+            "created_at should be a number"
+        );
     }
 }

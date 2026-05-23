@@ -1,6 +1,6 @@
-use actix_web::{middleware::Logger, web, App, HttpServer};
 use actix_cors::Cors;
 use actix_files as fs;
+use actix_web::{middleware::Logger, web, App, HttpServer};
 use anyhow::Result;
 use kuiperdb_core::*;
 use std::sync::Arc;
@@ -138,7 +138,7 @@ async fn main() -> Result<()> {
     let cors_config = config.cors.clone();
     let server = HttpServer::new(move || {
         let mut cors = Cors::default();
-        
+
         if cors_config.enabled {
             for origin in &cors_config.allowed_origins {
                 cors = cors.allowed_origin(origin);
@@ -150,6 +150,9 @@ async fn main() -> Result<()> {
                     actix_web::http::header::ACCEPT,
                     actix_web::http::header::CONTENT_TYPE,
                 ])
+                .allowed_header(actix_web::http::header::HeaderName::from_static(
+                    "x-client-features",
+                ))
                 .max_age(3600);
         }
 

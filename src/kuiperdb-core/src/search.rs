@@ -1,6 +1,6 @@
 use anyhow::Result;
-use sqlx::Error as SqlxError;
 use serde::{Deserialize, Serialize};
+use sqlx::Error as SqlxError;
 use std::collections::HashMap;
 
 use crate::embedder::Embedder;
@@ -39,15 +39,23 @@ pub struct HybridSearcher {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SearchResult {
+    /// Document ID
     pub id: String,
+    /// Document contents
     pub content: String,
+    /// Document metadata
     pub metadata: HashMap<String, serde_json::Value>,
+    /// Combined RRF score
     pub score: f64,
+    /// FTS rank
     pub fts_rank: Option<f64>,
+    /// Vector similarity
     pub vector_similarity: Option<f64>,
-    // Chunking fields
+    /// Chunking fields
     pub is_chunk: bool,
+    /// Parent document ID if this is a chunk
     pub parent_id: Option<String>,
+    /// Chunk index if this is a chunk
     pub chunk_index: Option<i32>,
 }
 
@@ -67,10 +75,7 @@ impl HybridSearcher {
         limit: usize,
     ) -> Result<Vec<SearchResult>> {
         // Get FTS5 results
-        let fts_results = match store
-            .search_fts(db_id, table_name, query, limit * 2)
-            .await
-        {
+        let fts_results = match store.search_fts(db_id, table_name, query, limit * 2).await {
             Ok(rows) => rows,
             Err(e) => {
                 // If the database or tables are missing, return an empty result set instead of failing
