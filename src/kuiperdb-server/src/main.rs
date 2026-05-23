@@ -14,11 +14,19 @@ async fn main() -> Result<()> {
     // Initialize OpenTelemetry tracing with file output
     let _guard = telemetry::init_telemetry()?;
 
-    // Load configuration
-    let config = config::Config::load("config.json").unwrap_or_else(|_| {
+    // Load bootstrap configuration and initialize the runtime settings database.
+    let bootstrap_config = config::Config::load("config.json").unwrap_or_else(|_| {
         tracing::warn!("Failed to load config.json, using defaults");
         config::Config::default()
     });
+    let (config, system_db_seeded) = bootstrap_config.load_or_initialize_system_db().await?;
+    let system_db_path = config.system_database_path();
+
+    if system_db_seeded {
+        tracing::info!("✓ Initialized system settings database at {}", system_db_path);
+    } else {
+        tracing::info!("✓ Loaded runtime settings from {}", system_db_path);
+    }
 
     tracing::info!("kuiperdb starting");
     tracing::info!("  Data directory: {}", config.data_dir);

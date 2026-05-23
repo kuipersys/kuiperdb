@@ -68,6 +68,11 @@ curl -X POST http://localhost:8081/db/mydb/documents/search \
 ## Configuration
 
 ### config.json
+
+`config.json` is now the bootstrap configuration source. On first startup, kuiperdb creates `data/system.db` and stores the effective settings there. After that, the server reads runtime settings from `system.db` for that data directory.
+
+`data_dir` still comes from `config.json`, because it tells the server where to find `system.db`.
+
 ```json
 {
   "server": {

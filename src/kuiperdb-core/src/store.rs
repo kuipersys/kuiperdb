@@ -8,6 +8,9 @@ use std::sync::Arc;
 use crate::index::{IndexConfig, VectorIndex};
 use crate::models::Document;
 
+const INTERNAL_DATABASES: &[&str] = &["global", "system"];
+const INTERNAL_TABLES: &[&str] = &["document_relations", "system_settings"];
+
 pub struct DocumentStore {
     base_dir: String,
     pools: HashMap<String, SqlitePool>,
@@ -20,6 +23,14 @@ pub struct DocumentStore {
     use_indexing: bool,
     /// Auto-enable threshold (document count)
     index_threshold: usize,
+}
+
+fn is_internal_database(db_name: &str) -> bool {
+    INTERNAL_DATABASES.contains(&db_name)
+}
+
+fn is_internal_table(table_name: &str) -> bool {
+    INTERNAL_TABLES.contains(&table_name)
 }
 
 impl DocumentStore {
@@ -615,7 +626,7 @@ impl DocumentStore {
 
     /// List all databases
     pub async fn list_databases(&self) -> Result<Vec<String>> {
-        let data_dir = Path::new("data");
+        let data_dir = Path::new(&self.base_dir);
         let mut databases = Vec::new();
 
         if !data_dir.exists() {
@@ -632,8 +643,7 @@ impl DocumentStore {
                     if ext == "db" {
                         if let Some(stem) = path.file_stem() {
                             let db_name = stem.to_string_lossy().to_string();
-                            // Skip global.db
-                            if db_name != "global" {
+                            if !is_internal_database(&db_name) {
                                 databases.push(db_name);
                             }
                         }
@@ -666,7 +676,11 @@ impl DocumentStore {
         .fetch_all(pool)
         .await?;
 
-        let tables: Vec<String> = rows.iter().map(|row| row.get("name")).collect();
+        let tables: Vec<String> = rows
+            .iter()
+            .map(|row| row.get("name"))
+            .filter(|name: &String| !is_internal_table(name))
+            .collect();
 
         Ok(tables)
     }
@@ -1333,4 +1347,67 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
 /// Validate table name (alphanumeric and underscores only)
 fn is_valid_table_name(name: &str) -> bool {
     !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DocumentStore;
+    use std::env;
+    use std::path::PathBuf;
+    use uuid::Uuid;
+
+    fn test_data_dir() -> PathBuf {
+        env::temp_dir().join(format!("kuiperdb-store-test-{}", Uuid::new_v4()))
+    }
+
+    #[tokio::test]
+    async fn list_databases_uses_store_base_dir_and_skips_internal_databases() {
+        let base_dir = test_data_dir();
+        tokio::fs::create_dir_all(&base_dir).await.unwrap();
+        tokio::fs::write(base_dir.join("alpha.db"), []).await.unwrap();
+        tokio::fs::write(base_dir.join("global.db"), []).await.unwrap();
+        tokio::fs::write(base_dir.join("system.db"), []).await.unwrap();
+
+        let store = DocumentStore::new(base_dir.to_string_lossy().to_string())
+            .await
+            .unwrap();
+
+        let databases = store.list_databases().await.unwrap();
+
+        assert_eq!(databases, vec!["alpha".to_string()]);
+
+        drop(store);
+        tokio::fs::remove_dir_all(&base_dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_tables_skips_internal_tables() {
+        let base_dir = test_data_dir();
+        let mut store = DocumentStore::new(base_dir.to_string_lossy().to_string())
+            .await
+            .unwrap();
+
+        store.ensure_table("alpha", "documents").await.unwrap();
+
+        let pool = store.get_pool("alpha").await.unwrap().clone();
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS system_settings (
+                setting_key TEXT PRIMARY KEY,
+                setting_value TEXT NOT NULL
+            )
+        "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let tables = store.list_tables("alpha").await.unwrap();
+
+        assert_eq!(tables, vec!["documents".to_string()]);
+
+        drop(pool);
+        drop(store);
+        tokio::fs::remove_dir_all(&base_dir).await.unwrap();
+    }
 }

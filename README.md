@@ -86,6 +86,19 @@ cargo run --release
 
 For detailed build instructions, cross-compilation, CI/CD, and development commands, see [BUILD.md](BUILD.md).
 
+## Configuration
+
+KuiperDb now uses two layers for server configuration:
+
+- `config.json` is the bootstrap source used at startup.
+- `data/system.db` is the persisted runtime settings store for that data directory.
+
+On first startup, the server creates `system.db` automatically and seeds it from `config.json` (or built-in defaults if `config.json` is missing). On later startups, the server loads its effective settings from `system.db`.
+
+`data_dir` remains a bootstrap setting in `config.json` because it determines where `system.db` is located. Other settings are persisted in `system.db` once that data directory has been initialized.
+
+This keeps mutable settings in SQLite, which matches the rest of the project and avoids introducing a separate YAML-based persistence path.
+
 ---
 
 ## Disclaimer

@@ -12,6 +12,8 @@ use kuiperdb_core::models::{
 };
 use kuiperdb_core::store::DocumentStore;
 
+const SYSTEM_DATABASE_NAME: &str = "system";
+
 /// Shared application state
 pub struct AppState {
     pub store: Arc<Mutex<DocumentStore>>,
@@ -51,6 +53,20 @@ pub struct LogAnalysisResponse {
 #[derive(Deserialize)]
 pub struct LogCleanupRequest {
     pub days_to_keep: Option<u32>,
+}
+
+fn reject_system_database_delete(db_name: &str) -> Option<HttpResponse> {
+    if db_name != SYSTEM_DATABASE_NAME {
+        return None;
+    }
+
+    Some(HttpResponse::Forbidden().json(ErrorResponse {
+        error: "deleting from the system database is prohibited".to_string(),
+        message: Some(
+            "Delete operations against the internal system database are not allowed through the API."
+                .to_string(),
+        ),
+    }))
 }
 
 /// Store a document
@@ -302,6 +318,10 @@ pub async fn delete_document(
     let (db_name, table_name, doc_id) = path.into_inner();
     tracing::debug!(db = %db_name, table = %table_name, doc_id = %doc_id, "Deleting document");
 
+    if let Some(response) = reject_system_database_delete(&db_name) {
+        return Ok(response);
+    }
+
     let mut store = state.store.lock().await;
     match store
         .delete_document_by_id(&db_name, &table_name, &doc_id)
@@ -329,6 +349,10 @@ pub async fn delete_table(
     let (db_name, table_name) = path.into_inner();
     tracing::debug!(db = %db_name, table = %table_name, "Deleting table");
 
+    if let Some(response) = reject_system_database_delete(&db_name) {
+        return Ok(response);
+    }
+
     let mut store = state.store.lock().await;
     match store.delete_table(&db_name, &table_name).await {
         Ok(_) => {
@@ -352,6 +376,10 @@ pub async fn delete_database(
 ) -> ActixResult<HttpResponse> {
     let db_name = path.into_inner();
     tracing::debug!(db = %db_name, "Deleting database");
+
+    if let Some(response) = reject_system_database_delete(&db_name) {
+        return Ok(response);
+    }
 
     let mut store = state.store.lock().await;
     match store.delete_database(&db_name).await {
@@ -595,6 +623,10 @@ pub async fn delete_relation(
 ) -> ActixResult<HttpResponse> {
     let (db_name, relation_id) = path.into_inner();
 
+    if let Some(response) = reject_system_database_delete(&db_name) {
+        return Ok(response);
+    }
+
     let mut store = state.store.lock().await;
     match store.delete_relation(&db_name, &relation_id).await {
         Ok(_) => Ok(HttpResponse::NoContent().finish()),
@@ -758,6 +790,10 @@ pub async fn rechunk_document(
     state: web::Data<AppState>,
 ) -> ActixResult<HttpResponse> {
     let (db_name, table_name, doc_id) = path.into_inner();
+
+    if let Some(response) = reject_system_database_delete(&db_name) {
+        return Ok(response);
+    }
 
     if !state.config.features.chunking || !state.config.chunking.enabled {
         return Ok(HttpResponse::NotImplemented().json(ErrorResponse {
@@ -1154,4 +1190,23 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route("/{filename}", web::get().to(view_log)),
     )
     .route("/health", web::get().to(health));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reject_system_database_delete;
+    use actix_web::http::StatusCode;
+
+    #[test]
+    fn rejects_delete_operations_for_system_database() {
+        let response = reject_system_database_delete("system")
+            .expect("system database deletes should be blocked");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn allows_delete_operations_for_user_databases() {
+        assert!(reject_system_database_delete("customer_docs").is_none());
+    }
 }

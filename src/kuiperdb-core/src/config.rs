@@ -1,4 +1,8 @@
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
+use sqlx::{sqlite::SqlitePool, Row};
+
+const SYSTEM_CONFIG_KEY: &str = "config";
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
@@ -194,8 +198,116 @@ impl Config {
         Ok(config)
     }
 
+    pub async fn load_or_initialize_system_db(&self) -> anyhow::Result<(Self, bool)> {
+        tokio::fs::create_dir_all(&self.data_dir)
+            .await
+            .with_context(|| format!("Failed to create data directory {}", self.data_dir))?;
+
+        let system_db_path = self.system_database_path();
+        let pool = SqlitePool::connect(&format!("sqlite://{}?mode=rwc", system_db_path))
+            .await
+            .with_context(|| {
+                format!("Failed to connect to system database {}", system_db_path)
+            })?;
+
+        Self::ensure_system_settings_table(&pool).await?;
+
+        let existing_config = sqlx::query(
+            r#"
+            SELECT setting_value
+            FROM system_settings
+            WHERE setting_key = ?
+        "#,
+        )
+        .bind(SYSTEM_CONFIG_KEY)
+        .fetch_optional(&pool)
+        .await
+        .context("Failed to load config from system.db")?;
+
+        let mut seeded_from_bootstrap = false;
+        let mut effective_config = if let Some(row) = existing_config {
+            let setting_value: String = row
+                .try_get("setting_value")
+                .context("Failed to read config payload from system.db")?;
+
+            match serde_json::from_str::<Config>(&setting_value) {
+                Ok(config) => config,
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "Stored config in system.db is invalid; restoring bootstrap settings"
+                    );
+                    Self::write_system_config(&pool, self).await?;
+                    seeded_from_bootstrap = true;
+                    self.clone()
+                }
+            }
+        } else {
+            Self::write_system_config(&pool, self).await?;
+            seeded_from_bootstrap = true;
+            self.clone()
+        };
+
+        if effective_config.data_dir != self.data_dir {
+            tracing::warn!(
+                stored_data_dir = %effective_config.data_dir,
+                bootstrap_data_dir = %self.data_dir,
+                "Ignoring data_dir stored in system.db; using bootstrap data_dir"
+            );
+            effective_config.data_dir = self.data_dir.clone();
+            Self::write_system_config(&pool, &effective_config).await?;
+        }
+
+        Ok((effective_config, seeded_from_bootstrap))
+    }
+
     pub fn database_path(&self, db_name: &str) -> String {
         format!("{}/{}.db", self.data_dir, db_name)
+    }
+
+    pub fn system_database_path(&self) -> String {
+        self.database_path("system")
+    }
+
+    async fn ensure_system_settings_table(pool: &SqlitePool) -> anyhow::Result<()> {
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS system_settings (
+                setting_key TEXT PRIMARY KEY,
+                setting_value TEXT NOT NULL,
+                value_format TEXT NOT NULL DEFAULT 'json',
+                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        "#,
+        )
+        .execute(pool)
+        .await
+        .context("Failed to create system_settings table")?;
+
+        Ok(())
+    }
+
+    async fn write_system_config(pool: &SqlitePool, config: &Config) -> anyhow::Result<()> {
+        let serialized_config = serde_json::to_string_pretty(config)
+            .context("Failed to serialize config for system.db")?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO system_settings (setting_key, setting_value, value_format)
+            VALUES (?, ?, 'json')
+            ON CONFLICT(setting_key) DO UPDATE SET
+                setting_value = excluded.setting_value,
+                value_format = excluded.value_format,
+                updated_at = CURRENT_TIMESTAMP
+        "#,
+        )
+        .bind(SYSTEM_CONFIG_KEY)
+        .bind(serialized_config)
+        .execute(pool)
+        .await
+        .context("Failed to persist config to system.db")?;
+
+        Ok(())
     }
 }
 
