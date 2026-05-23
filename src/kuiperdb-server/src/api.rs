@@ -47,7 +47,7 @@ pub struct LogAnalysisResponse {
     pub errors: Vec<String>,
 }
 
-/// Log cleanup request
+/// Request body for cleaning up old log files
 #[derive(Deserialize)]
 pub struct LogCleanupRequest {
     pub days_to_keep: Option<u32>,
@@ -55,25 +55,45 @@ pub struct LogCleanupRequest {
 
 /// Store a document
 /// POST /db/{db_name}/{table_name}
-#[tracing::instrument(skip(path, req, state, http_req))]
+#[tracing::instrument(skip(path, http_req, req, state))]
 pub async fn store_document(
     path: web::Path<(String, String)>,
+    http_req: HttpRequest,
     req: web::Json<StoreDocumentRequest>,
     state: web::Data<AppState>,
-    http_req: HttpRequest,
 ) -> ActixResult<HttpResponse> {
     let (db_name, table_name) = path.into_inner();
-    tracing::debug!(db = %db_name, table = %table_name, "Storing document");
 
-    if req.content.is_empty() {
+    if req.content.trim().is_empty() {
         return Ok(HttpResponse::BadRequest().json(ErrorResponse {
             error: "content is required".to_string(),
             message: None,
         }));
     }
 
-    // Use the cleaner add_document API
     let mut store = state.store.lock().await;
+
+    // Missing database or table -> 404
+    if !store.database_exists(&db_name) {
+        return Ok(HttpResponse::NotFound().json(ErrorResponse {
+            error: "document not found".to_string(),
+            message: None,
+        }));
+    }
+
+    let table_exists = store
+        .table_exists(&db_name, &table_name)
+        .await
+        .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Table check failed: {}", e)))?;
+
+    if !table_exists {
+        return Ok(HttpResponse::NotFound().json(ErrorResponse {
+            error: "document not found".to_string(),
+            message: None,
+        }));
+    }
+
+    // Use the cleaner add_document API
     let mut doc = match store
         .add_document(&db_name, &table_name, req.0.clone())
         .await
@@ -443,7 +463,14 @@ pub async fn list_tables(
 ) -> ActixResult<HttpResponse> {
     let db_name = path.into_inner();
     let mut store = state.store.lock().await;
-    
+
+    // If the database does not exist, return an empty set
+    if !store.database_exists(&db_name) {
+        return Ok(HttpResponse::Ok().json(serde_json::json!({
+            "tables": Vec::<serde_json::Value>::new()
+        })));
+    }
+
     let tables = store.list_tables(&db_name).await.map_err(|e| {
         actix_web::error::ErrorInternalServerError(format!("Failed to list tables: {}", e))
     })?;
@@ -467,7 +494,25 @@ pub async fn list_documents(
 ) -> ActixResult<HttpResponse> {
     let (db_name, table_name) = path.into_inner();
     let mut store = state.store.lock().await;
-    
+
+    // Return empty set if database or table is missing
+    if !store.database_exists(&db_name) {
+        return Ok(HttpResponse::Ok().json(serde_json::json!({
+            "documents": Vec::<serde_json::Value>::new()
+        })));
+    }
+
+    let table_exists = store
+        .table_exists(&db_name, &table_name)
+        .await
+        .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Table check failed: {}", e)))?;
+
+    if !table_exists {
+        return Ok(HttpResponse::Ok().json(serde_json::json!({
+            "documents": Vec::<serde_json::Value>::new()
+        })));
+    }
+
     // Get all documents (not just non-embedded ones)
     let all_docs = store.get_all_documents(&db_name, &table_name, 1000).await
         .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Query error: {}", e)))?;
@@ -742,6 +787,27 @@ pub async fn get_chunks(
     let (db_name, table_name, doc_id) = path.into_inner();
 
     let mut store = state.store.lock().await;
+
+    // Missing database or table -> 404
+    if !store.database_exists(&db_name) {
+        return Ok(HttpResponse::NotFound().json(ErrorResponse {
+            error: "document not found".to_string(),
+            message: None,
+        }));
+    }
+
+    let table_exists = store
+        .table_exists(&db_name, &table_name)
+        .await
+        .map_err(|e| actix_web::error::ErrorInternalServerError(format!("Table check failed: {}", e)))?;
+
+    if !table_exists {
+        return Ok(HttpResponse::NotFound().json(ErrorResponse {
+            error: "document not found".to_string(),
+            message: None,
+        }));
+    }
+
     match store.get_chunks(&db_name, &table_name, &doc_id).await {
         Ok(chunks) => Ok(HttpResponse::Ok().json(chunks)),
         Err(e) => Ok(HttpResponse::InternalServerError().json(ErrorResponse {

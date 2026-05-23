@@ -117,6 +117,7 @@ async fn main() -> anyhow::Result<()> {
             parent_id: None,
             chunk_index: None,
             token_count: None,
+            is_vectorized: true,
         };
 
         store.store_document(db_name, table_name, doc).await?;

@@ -45,6 +45,12 @@ impl DocumentStore {
         })
     }
 
+    /// Return true if the backing database file exists on disk
+    pub fn database_exists(&self, db_id: &str) -> bool {
+        let db_path = format!("{}/{}.db", self.base_dir, db_id);
+        Path::new(&db_path).exists()
+    }
+
     /// Configure vector indexing
     pub fn configure_indexing(&mut self, enabled: bool, threshold: usize, config: IndexConfig) {
         self.use_indexing = enabled;
@@ -169,6 +175,27 @@ impl DocumentStore {
         self.create_relations_table(db_id).await?;
 
         Ok(())
+    }
+
+    /// Check if a table exists without creating it
+    pub async fn table_exists(&mut self, db_id: &str, table_name: &str) -> Result<bool> {
+        if !self.database_exists(db_id) {
+            return Ok(false);
+        }
+
+        if !is_valid_table_name(table_name) {
+            return Ok(false);
+        }
+
+        let pool = self.get_pool(db_id).await?;
+        let row = sqlx::query(
+            r#"SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?"#,
+        )
+        .bind(table_name)
+        .fetch_optional(pool)
+        .await?;
+
+        Ok(row.is_some())
     }
 
     async fn create_relations_table(&mut self, db_id: &str) -> Result<()> {

@@ -1,4 +1,5 @@
 use anyhow::Result;
+use sqlx::Error as SqlxError;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -66,16 +67,36 @@ impl HybridSearcher {
         limit: usize,
     ) -> Result<Vec<SearchResult>> {
         // Get FTS5 results
-        let fts_results = store
+        let fts_results = match store
             .search_fts(db_id, table_name, query, limit * 2)
-            .await?;
+            .await
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                // If the database or tables are missing, return an empty result set instead of failing
+                if Self::is_missing_table_error(&e) {
+                    return Ok(Vec::new());
+                }
+                return Err(e);
+            }
+        };
 
         // Get vector results if embedder available
         let vector_results = if let Some(emb) = embedder {
             let query_vector = emb.embed(query).await?;
-            store
+            match store
                 .search_vector(db_id, table_name, &query_vector, limit * 2)
-                .await?
+                .await
+            {
+                Ok(rows) => rows,
+                Err(e) => {
+                    if Self::is_missing_table_error(&e) {
+                        Vec::new()
+                    } else {
+                        return Err(e);
+                    }
+                }
+            }
         } else {
             Vec::new()
         };
@@ -181,5 +202,18 @@ impl HybridSearcher {
 impl Default for HybridSearcher {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl HybridSearcher {
+    /// Detect a missing table/database error from SQLite and treat it as a soft miss.
+    fn is_missing_table_error(err: &anyhow::Error) -> bool {
+        if let Some(sqlx_err) = err.downcast_ref::<SqlxError>() {
+            if let SqlxError::Database(db_err) = sqlx_err {
+                let msg = db_err.message().to_lowercase();
+                return msg.contains("no such table") || msg.contains("no such database");
+            }
+        }
+        false
     }
 }
