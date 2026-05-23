@@ -90,7 +90,7 @@ For detailed build instructions, cross-compilation, CI/CD, and development comma
 
 ## Disclaimer
 
-*This project was generated with the assistance of Claude Sonnet 4.5 via GitHub Copilot in VS Code.*
+*The original project was generated with the assistance of Claude Sonnet 4.5 via GitHub Copilot in VS Code.*
 
 *I include these tools for transparency and provenance tracking in case this is ever useful to others in the future.*
 
