@@ -1,6 +1,6 @@
 # KuiperDb Changelog
 
-## Unreleased - Model-agnostic embedded core
+## v0.2.0 - Model-agnostic embedded core
 
 - Replaced document-centric storage with stable records, opaque JSON payloads and metadata, and generic relationships.
 - Made caller-supplied vectors the only ingestion and search primitive.
