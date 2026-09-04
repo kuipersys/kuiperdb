@@ -17,47 +17,22 @@ path = "src/lib.rs"
 # Core library
 kuiperdb-core = { path = "../kuiperdb-core" }
 
-# Async runtime
-tokio.workspace = true
-
 # HTTP server
 actix-web = "4.13"
 actix-cors = "0.7"
-actix-files = "0.6"
 
 # Serialization
 serde.workspace = true
 serde_json.workspace = true
 
-# Database
-sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite", "chrono"] }
-
 # Error handling
 anyhow.workspace = true
-thiserror.workspace = true
 
 # Logging & Telemetry
 tracing.workspace = true
 tracing-subscriber.workspace = true
-tracing-actix-web = "0.7"
 tracing-appender = "0.2"
 rolling-file = "0.2"
 
-# Utilities
-uuid.workspace = true
-chrono.workspace = true
-[[example]]
-name = "simple_embedded"
-path = "../examples/simple_embedded.rs"
-
-[[example]]
-name = "embedded_app"
-path = "../examples/embedded_app.rs"
-
-[[example]]
-name = "advanced_embedded"
-path = "../examples/advanced_embedded.rs"
-
-[[example]]
-name = "with_embeddings"
-path = "../examples/with_embeddings.rs"
+[dev-dependencies]
+tempfile = "3"

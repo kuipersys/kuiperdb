@@ -1,31 +1,16 @@
-//! KuiperDb Core Library
+//! KuiperDB's embedded, model-agnostic storage engine.
 //!
-//! This crate provides the core functionality for KuiperDb, including:
-//! - Database storage layer
-//! - Vector indexing with HNSW
-//! - Graph operations
-//! - Search functionality
-//! - Embedding generation and chunking
-//! - Caching layer
+//! The core stores records, metadata, relationships, and caller-supplied vectors.
+//! It deliberately does not parse content, chunk documents, call models, cache
+//! inference output, or expose a network protocol.
 
-pub mod cache;
-pub mod chunking;
-pub mod config;
-pub mod embedder;
 pub mod graph;
 pub mod index;
 pub mod models;
 pub mod search;
 pub mod store;
-pub mod worker;
 
-// Re-export commonly used types
-pub use cache::EmbeddingCache;
-pub use config::Config;
-pub use embedder::Embedder;
-pub use graph::GraphStatistics;
-pub use index::VectorIndex;
+pub use graph::{Graph, GraphStatistics, ShortestPath, TraversalResult};
+pub use index::IndexConfig;
 pub use models::*;
-pub use search::{HybridSearcher, SearchResult};
-pub use store::DocumentStore;
-pub use worker::BackgroundWorker;
+pub use store::Database;

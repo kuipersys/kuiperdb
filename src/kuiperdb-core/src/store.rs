@@ -1,1399 +1,1070 @@
+use crate::index::{IndexMap, VectorIndex};
+use crate::models::*;
+use crate::search::distance;
 use anyhow::{Context, Result};
-use chrono::Utc;
-use sqlx::{sqlite::SqlitePool, Row};
-use std::collections::HashMap;
+use chrono::{DateTime, Utc};
+use sqlx::sqlite::{
+    SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow, SqliteSynchronous,
+};
+use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
+use tokio::sync::RwLock;
+use uuid::Uuid;
 
-use crate::index::{IndexConfig, VectorIndex};
-use crate::models::Document;
+const SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS records (
+    id TEXT PRIMARY KEY,
+    payload TEXT,
+    metadata TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS vector_spaces (
+    name TEXT PRIMARY KEY,
+    dimensions INTEGER NOT NULL CHECK (dimensions > 0),
+    distance_metric TEXT NOT NULL,
+    normalization TEXT NOT NULL,
+    index_config TEXT NOT NULL,
+    generation INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS vectors (
+    record_id TEXT NOT NULL REFERENCES records(id) ON DELETE CASCADE,
+    space TEXT NOT NULL REFERENCES vector_spaces(name) ON DELETE CASCADE,
+    values_blob BLOB NOT NULL,
+    PRIMARY KEY (record_id, space)
+);
+CREATE TABLE IF NOT EXISTS record_metadata (
+    record_id TEXT NOT NULL REFERENCES records(id) ON DELETE CASCADE,
+    key TEXT NOT NULL,
+    value_json TEXT NOT NULL,
+    PRIMARY KEY (record_id, key)
+);
+CREATE TABLE IF NOT EXISTS relations (
+    id TEXT PRIMARY KEY,
+    source_id TEXT NOT NULL REFERENCES records(id) ON DELETE CASCADE,
+    target_id TEXT NOT NULL REFERENCES records(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL,
+    metadata TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_vectors_space ON vectors(space);
+CREATE INDEX IF NOT EXISTS idx_record_metadata_lookup ON record_metadata(key, value_json, record_id);
+CREATE INDEX IF NOT EXISTS idx_relations_source ON relations(source_id);
+CREATE INDEX IF NOT EXISTS idx_relations_target ON relations(target_id);
+CREATE TRIGGER IF NOT EXISTS vectors_generation_insert AFTER INSERT ON vectors BEGIN
+  UPDATE vector_spaces SET generation = generation + 1 WHERE name = NEW.space;
+END;
+CREATE TRIGGER IF NOT EXISTS vectors_generation_update AFTER UPDATE ON vectors BEGIN
+  UPDATE vector_spaces SET generation = generation + 1 WHERE name = NEW.space;
+  UPDATE vector_spaces SET generation = generation + 1 WHERE name = OLD.space AND OLD.space <> NEW.space;
+END;
+CREATE TRIGGER IF NOT EXISTS vectors_generation_delete AFTER DELETE ON vectors BEGIN
+  UPDATE vector_spaces SET generation = generation + 1 WHERE name = OLD.space;
+END;
+PRAGMA user_version = 1;
+"#;
 
-pub struct DocumentStore {
-    base_dir: String,
-    pools: HashMap<String, SqlitePool>,
-    global_pool: Option<SqlitePool>,
-    /// Per-database vector indexes
-    indexes: HashMap<String, Arc<VectorIndex>>,
-    /// Index configuration
-    index_config: IndexConfig,
-    /// Whether to use vector indexing
-    use_indexing: bool,
-    /// Auto-enable threshold (document count)
-    index_threshold: usize,
+/// A cloneable handle to one embedded KuiperDB database.
+///
+/// SQLite is authoritative. ANN indexes are process-local derived state and are
+/// automatically rebuilt when their persistent generation changes.
+#[derive(Clone)]
+pub struct Database {
+    pool: SqlitePool,
+    indexes: Arc<RwLock<IndexMap>>,
 }
 
-impl DocumentStore {
-    pub async fn new(base_dir: String) -> Result<Self> {
-        tokio::fs::create_dir_all(&base_dir)
-            .await
-            .context("Failed to create base directory")?;
+impl Database {
+    pub async fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with(path, OpenOptions::default()).await
+    }
 
-        // Create global pool for cache
-        let global_db_path = format!("{}/global.db", base_dir);
-        let global_pool = SqlitePool::connect(&format!("sqlite://{}?mode=rwc", global_db_path))
+    pub async fn open_with(path: impl AsRef<Path>, settings: OpenOptions) -> Result<Self> {
+        let path = path.as_ref();
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let options = SqliteConnectOptions::new()
+            .filename(path)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Normal)
+            .foreign_keys(true)
+            .busy_timeout(settings.busy_timeout);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(settings.max_connections)
+            .connect_with(options)
             .await
-            .context("Failed to connect to global database")?;
-
+            .with_context(|| format!("failed to open KuiperDB at {}", path.display()))?;
+        sqlx::raw_sql(SCHEMA).execute(&pool).await?;
         Ok(Self {
-            base_dir,
-            pools: HashMap::new(),
-            global_pool: Some(global_pool),
-            indexes: HashMap::new(),
-            index_config: IndexConfig::default(),
-            use_indexing: false,
-            index_threshold: 1000,
+            pool,
+            indexes: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
-    /// Return true if the backing database file exists on disk
-    pub fn database_exists(&self, db_id: &str) -> bool {
-        let db_path = format!("{}/{}.db", self.base_dir, db_id);
-        Path::new(&db_path).exists()
+    pub fn pool(&self) -> &SqlitePool {
+        &self.pool
     }
 
-    /// Configure vector indexing
-    pub fn configure_indexing(&mut self, enabled: bool, threshold: usize, config: IndexConfig) {
-        self.use_indexing = enabled;
-        self.index_threshold = threshold;
-        self.index_config = config.clone();
-        tracing::info!(
-            "Vector indexing configured: enabled={}, threshold={}, m={}, ef_construction={}, ef_search={}",
-            enabled, threshold, config.hnsw_m, config.hnsw_ef_construction, config.hnsw_ef_search
-        );
-    }
-
-    /// Get global pool for cache
-    pub async fn get_global_pool(&self) -> Result<SqlitePool> {
-        self.global_pool
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("Global pool not initialized"))
-    }
-
-    /// Get or create database pool for a specific database
-    pub async fn get_pool(&mut self, db_id: &str) -> Result<&SqlitePool> {
-        if !self.pools.contains_key(db_id) {
-            let db_path = format!("{}/{}.db", self.base_dir, db_id);
-            let connection_string = format!("sqlite://{}?mode=rwc", db_path);
-            let pool = SqlitePool::connect(&connection_string)
-                .await
-                .context("Failed to connect to database")?;
-
-            // Enable foreign keys
-            sqlx::query("PRAGMA foreign_keys = ON")
-                .execute(&pool)
-                .await?;
-
-            self.pools.insert(db_id.to_string(), pool);
+    pub async fn create_vector_space(&self, space: VectorSpace) -> Result<()> {
+        validate_space(&space)?;
+        if let Some(existing) = self.get_vector_space(&space.name).await? {
+            if existing == space {
+                return Ok(());
+            }
+            anyhow::bail!(
+                "vector space '{}' already exists with a different contract",
+                space.name
+            );
         }
-
-        Ok(self.pools.get(db_id).unwrap())
-    }
-
-    /// Ensure a table exists
-    pub async fn ensure_table(&mut self, db_id: &str, table_name: &str) -> Result<()> {
-        if !is_valid_table_name(table_name) {
-            anyhow::bail!("Invalid table name: {}", table_name);
-        }
-
-        let pool = self.get_pool(db_id).await?;
-
-        // Create main documents table
-        let create_table = format!(
-            r#"
-            CREATE TABLE IF NOT EXISTS "{}" (
-                id TEXT PRIMARY KEY,
-                content TEXT NOT NULL,
-                metadata TEXT,
-                tags TEXT,
-                vector BLOB,
-                created_at DATETIME NOT NULL,
-                updated_at DATETIME NOT NULL,
-                is_embedded INTEGER DEFAULT 0,
-                vectorize INTEGER DEFAULT 1,
-                is_chunk INTEGER DEFAULT 0,
-                parent_id TEXT DEFAULT NULL,
-                chunk_index INTEGER DEFAULT NULL,
-                token_count INTEGER DEFAULT NULL,
-                is_vectorized INTEGER DEFAULT 0,
-                FOREIGN KEY (parent_id) REFERENCES "{}"(id) ON DELETE CASCADE
-            )
-        "#,
-            table_name, table_name
-        );
-
-        sqlx::query(sqlx::AssertSqlSafe(create_table))
-            .execute(pool)
-            .await?;
-
-        // Create FTS5 virtual table
-        let create_fts = format!(
-            r#"
-            CREATE VIRTUAL TABLE IF NOT EXISTS "{}_fts" USING fts5(
-                id UNINDEXED,
-                content,
-                content='{}',
-                content_rowid='rowid'
-            )
-        "#,
-            table_name, table_name
-        );
-
-        sqlx::query(sqlx::AssertSqlSafe(create_fts))
-            .execute(pool)
-            .await?;
-
-        // Create triggers - re-get pool to work around borrow checker
-        self.create_fts_triggers_for_table(db_id, table_name)
-            .await?;
-
-        // Create indexes - re-get pool again
-        let pool = self.get_pool(db_id).await?;
-        let indexes = vec![
-            format!(
-                r#"CREATE INDEX IF NOT EXISTS idx_{}_created_at ON "{}"(created_at)"#,
-                table_name, table_name
-            ),
-            format!(
-                r#"CREATE INDEX IF NOT EXISTS idx_{}_updated_at ON "{}"(updated_at)"#,
-                table_name, table_name
-            ),
-            format!(
-                r#"CREATE INDEX IF NOT EXISTS idx_{}_embedded ON "{}"(is_embedded)"#,
-                table_name, table_name
-            ),
-            format!(
-                r#"CREATE INDEX IF NOT EXISTS idx_{}_parent ON "{}"(parent_id) WHERE parent_id IS NOT NULL"#,
-                table_name, table_name
-            ),
-            format!(
-                r#"CREATE INDEX IF NOT EXISTS idx_{}_chunks ON "{}"(is_chunk, parent_id) WHERE is_chunk = 1"#,
-                table_name, table_name
-            ),
-        ];
-
-        for index_sql in indexes {
-            sqlx::query(sqlx::AssertSqlSafe(index_sql))
-                .execute(pool)
-                .await?;
-        }
-
-        // Create document_relations table (shared for all tables in this db)
-        self.create_relations_table(db_id).await?;
-
+        sqlx::query(
+            "INSERT INTO vector_spaces(name, dimensions, distance_metric, normalization, index_config) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(&space.name)
+        .bind(space.dimensions as i64)
+        .bind(space.distance_metric.as_str())
+        .bind(space.normalization.as_str())
+        .bind(serde_json::to_string(&space.index)?)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
-    /// Check if a table exists without creating it
-    pub async fn table_exists(&mut self, db_id: &str, table_name: &str) -> Result<bool> {
-        if !self.database_exists(db_id) {
-            return Ok(false);
-        }
-
-        if !is_valid_table_name(table_name) {
-            return Ok(false);
-        }
-
-        let pool = self.get_pool(db_id).await?;
-        let row =
-            sqlx::query(r#"SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?"#)
-                .bind(table_name)
-                .fetch_optional(pool)
-                .await?;
-
-        Ok(row.is_some())
+    pub async fn get_vector_space(&self, name: &str) -> Result<Option<VectorSpace>> {
+        let row = sqlx::query(
+            "SELECT name, dimensions, distance_metric, normalization, index_config FROM vector_spaces WHERE name = ?",
+        )
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(vector_space_from_row).transpose()
     }
 
-    async fn create_relations_table(&mut self, db_id: &str) -> Result<()> {
-        let pool = self.get_pool(db_id).await?;
-
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS document_relations (
-                id TEXT PRIMARY KEY,
-                source_id TEXT NOT NULL,
-                target_id TEXT NOT NULL,
-                relation_type TEXT NOT NULL,
-                metadata TEXT,
-                created_at DATETIME NOT NULL
-            )
-        "#,
-        )
-        .execute(pool)
-        .await?;
-
-        // Create indexes
-        sqlx::query(
-            r#"
-            CREATE INDEX IF NOT EXISTS idx_relations_source ON document_relations(source_id)
-        "#,
-        )
-        .execute(pool)
-        .await?;
-
-        sqlx::query(
-            r#"
-            CREATE INDEX IF NOT EXISTS idx_relations_target ON document_relations(target_id)
-        "#,
-        )
-        .execute(pool)
-        .await?;
-
-        sqlx::query(
-            r#"
-            CREATE INDEX IF NOT EXISTS idx_relations_type ON document_relations(relation_type)
-        "#,
-        )
-        .execute(pool)
-        .await?;
-
-        sqlx::query(
-            r#"
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_relations_unique
-            ON document_relations(source_id, target_id, relation_type)
-        "#,
-        )
-        .execute(pool)
-        .await?;
-
-        Ok(())
+    pub async fn list_vector_spaces(&self) -> Result<Vec<VectorSpace>> {
+        sqlx::query("SELECT name, dimensions, distance_metric, normalization, index_config FROM vector_spaces ORDER BY name")
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(vector_space_from_row)
+            .collect()
     }
 
-    async fn create_fts_triggers_for_table(&mut self, db_id: &str, table_name: &str) -> Result<()> {
-        let pool = self.get_pool(db_id).await?;
-        // Insert trigger
-        let insert_trigger = format!(
-            r#"
-            CREATE TRIGGER IF NOT EXISTS {}_ai AFTER INSERT ON "{}" BEGIN
-                INSERT INTO "{}_fts"(rowid, id, content)
-                VALUES (new.rowid, new.id, new.content);
-            END
-        "#,
-            table_name, table_name, table_name
-        );
-
-        // Delete trigger
-        let delete_trigger = format!(
-            r#"
-            CREATE TRIGGER IF NOT EXISTS {}_ad AFTER DELETE ON "{}" BEGIN
-                DELETE FROM "{}_fts" WHERE rowid = old.rowid;
-            END
-        "#,
-            table_name, table_name, table_name
-        );
-
-        // Update trigger
-        let update_trigger = format!(
-            r#"
-            CREATE TRIGGER IF NOT EXISTS {}_au AFTER UPDATE ON "{}" BEGIN
-                UPDATE "{}_fts" SET content = new.content WHERE rowid = old.rowid;
-            END
-        "#,
-            table_name, table_name, table_name
-        );
-
-        sqlx::query(sqlx::AssertSqlSafe(insert_trigger))
-            .execute(pool)
-            .await?;
-        sqlx::query(sqlx::AssertSqlSafe(delete_trigger))
-            .execute(pool)
-            .await?;
-        sqlx::query(sqlx::AssertSqlSafe(update_trigger))
-            .execute(pool)
-            .await?;
-
-        Ok(())
-    }
-
-    /// Store a document
-    pub async fn store_document(
-        &mut self,
-        db_id: &str,
-        table_name: &str,
-        doc: Document,
+    /// Changes ANN tuning without changing the mathematical vector-space contract.
+    /// Advancing the generation invalidates indexes loaded by every process.
+    pub async fn update_index_config(
+        &self,
+        space_name: &str,
+        config: crate::IndexConfig,
     ) -> Result<()> {
-        self.ensure_table(db_id, table_name).await?;
-        let pool = self.get_pool(db_id).await?;
-
-        // Serialize metadata
-        let metadata_json = serde_json::to_string(&doc.metadata)?;
-
-        // Serialize tags
-        let tags_str = doc.tags.join(",");
-
-        // Serialize vector
-        let (vector_bytes, is_embedded, is_vectorized) = if let Some(ref vector) = doc.vector {
-            (Some(serialize_vector(vector)), 1, 1)
-        } else {
-            (None, 0, 0)
-        };
-
-        // Calculate token count if not already set (estimate: 1 token per 4 characters)
-        let token_count = doc
-            .token_count
-            .unwrap_or_else(|| (doc.content.len() as f32 / 4.0).ceil() as i32);
-
-        let query = format!(
-            r#"
-            INSERT INTO "{}" (id, content, metadata, tags, vector, created_at, updated_at, is_embedded, vectorize, is_chunk, parent_id, chunk_index, token_count, is_vectorized)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                content = excluded.content,
-                metadata = excluded.metadata,
-                tags = excluded.tags,
-                vector = excluded.vector,
-                updated_at = excluded.updated_at,
-                is_embedded = excluded.is_embedded,
-                vectorize = excluded.vectorize,
-                is_chunk = excluded.is_chunk,
-                parent_id = excluded.parent_id,
-                chunk_index = excluded.chunk_index,
-                token_count = excluded.token_count,
-                is_vectorized = excluded.is_vectorized
-        "#,
-            table_name
-        );
-
-        sqlx::query(sqlx::AssertSqlSafe(query))
-            .bind(&doc.id)
-            .bind(&doc.content)
-            .bind(&metadata_json)
-            .bind(&tags_str)
-            .bind(&vector_bytes)
-            .bind(doc.created_at)
-            .bind(doc.updated_at)
-            .bind(is_embedded)
-            .bind(if doc.vectorize { 1 } else { 0 })
-            .bind(if doc.is_chunk { 1 } else { 0 })
-            .bind(&doc.parent_id)
-            .bind(doc.chunk_index)
-            .bind(token_count)
-            .bind(is_vectorized)
-            .execute(pool)
-            .await?;
-
+        validate_index_config(&config)?;
+        let result = sqlx::query(
+            "UPDATE vector_spaces SET index_config = ?, generation = generation + 1 WHERE name = ?",
+        )
+        .bind(serde_json::to_string(&config)?)
+        .bind(space_name)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            anyhow::bail!("unknown vector space '{space_name}'");
+        }
+        self.indexes.write().await.remove(space_name);
         Ok(())
     }
 
-    /// Get a document by ID
-    pub async fn get_document(
-        &mut self,
-        db_id: &str,
-        table_name: &str,
-        id: &str,
-    ) -> Result<Document> {
-        let pool = self.get_pool(db_id).await?;
+    /// Removes a vector space and its vectors; records and relations are retained.
+    pub async fn delete_vector_space(&self, name: &str) -> Result<bool> {
+        let result = sqlx::query("DELETE FROM vector_spaces WHERE name = ?")
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
+        self.indexes.write().await.remove(name);
+        Ok(result.rows_affected() != 0)
+    }
 
-        let query = format!(
-            r#"
-            SELECT id, content, metadata, tags, vector, created_at, updated_at, is_embedded,
-                   vectorize, is_chunk, parent_id, chunk_index, token_count, is_vectorized
-            FROM "{}"
-            WHERE id = ?
-        "#,
-            table_name
-        );
+    pub async fn put_record(&self, input: RecordInput) -> Result<Record> {
+        let mut records = self.put_records(vec![input]).await?;
+        Ok(records.remove(0))
+    }
 
-        let row = sqlx::query(sqlx::AssertSqlSafe(query))
+    /// Atomically upserts a batch. Existing vectors in spaces omitted from an input are retained.
+    pub async fn put_records(&self, inputs: Vec<RecordInput>) -> Result<Vec<Record>> {
+        if inputs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let spaces = self.space_map().await?;
+        let mut prepared = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            let id = input.id.unwrap_or_else(|| Uuid::new_v4().to_string());
+            if id.is_empty() {
+                anyhow::bail!("record id cannot be empty");
+            }
+            let mut seen = HashSet::new();
+            for vector in &input.vectors {
+                if !seen.insert(&vector.space) {
+                    anyhow::bail!(
+                        "record '{id}' supplies vector space '{}' more than once",
+                        vector.space
+                    );
+                }
+                let space = spaces
+                    .get(&vector.space)
+                    .with_context(|| format!("unknown vector space '{}'", vector.space))?;
+                validate_vector(space, &vector.values)?;
+            }
+            prepared.push((id, input.payload, input.metadata, input.vectors));
+        }
+
+        let mut transaction = self.pool.begin().await?;
+        let now = Utc::now();
+        for (id, payload, metadata, vectors) in &prepared {
+            sqlx::query(
+                "INSERT INTO records(id, payload, metadata, created_at, updated_at) VALUES (?, ?, ?, ?, ?) \
+                 ON CONFLICT(id) DO UPDATE SET payload=excluded.payload, metadata=excluded.metadata, updated_at=excluded.updated_at",
+            )
             .bind(id)
-            .fetch_one(pool)
-            .await
-            .context("Document not found")?;
-
-        let metadata_json: String = row.get("metadata");
-        let metadata: HashMap<String, serde_json::Value> =
-            serde_json::from_str(&metadata_json).unwrap_or_default();
-
-        let tags_str: String = row.get("tags");
-        let tags: Vec<String> = if tags_str.is_empty() {
-            Vec::new()
-        } else {
-            tags_str.split(',').map(String::from).collect()
-        };
-
-        let vector_bytes: Option<Vec<u8>> = row.get("vector");
-        let vector = vector_bytes.map(|bytes| deserialize_vector(&bytes));
-
-        let is_embedded: i32 = row.get("is_embedded");
-        let vectorize: i32 = row.get("vectorize");
-        let is_chunk: i32 = row.get("is_chunk");
-        let is_vectorized: i32 = row.get("is_vectorized");
-
-        Ok(Document {
-            id: row.get("id"),
-            db: db_id.to_string(),
-            table: table_name.to_string(),
-            content: row.get("content"),
-            metadata,
-            tags,
-            vector,
-            created_at: row.get("created_at"),
-            updated_at: row.get("updated_at"),
-            is_embedded: is_embedded == 1,
-            vectorize: vectorize == 1,
-            is_chunk: is_chunk == 1,
-            parent_id: row.get("parent_id"),
-            chunk_index: row.get("chunk_index"),
-            token_count: row.get("token_count"),
-            is_vectorized: is_vectorized == 1,
-        })
-    }
-
-    /// Get documents that need embedding
-    pub async fn get_non_embedded_documents(
-        &mut self,
-        db_id: &str,
-        table_name: &str,
-        limit: i32,
-    ) -> Result<Vec<Document>> {
-        let pool = self.get_pool(db_id).await?;
-
-        let query = format!(
-            r#"
-            SELECT id, content, metadata, tags, vector, created_at, updated_at, is_embedded, vectorize, is_chunk, parent_id, chunk_index, token_count, is_vectorized
-            FROM "{}"
-            WHERE is_embedded = 0 AND vectorize = 1
-            ORDER BY created_at ASC
-            LIMIT ?
-        "#,
-            table_name
-        );
-
-        let rows = sqlx::query(sqlx::AssertSqlSafe(query))
-            .bind(limit)
-            .fetch_all(pool)
+            .bind(payload.as_ref().map(serde_json::to_string).transpose()?)
+            .bind(serde_json::to_string(metadata)?)
+            .bind(now)
+            .bind(now)
+            .execute(&mut *transaction)
             .await?;
-
-        let mut documents = Vec::new();
-        for row in rows {
-            let metadata_json: String = row.get("metadata");
-            let metadata: HashMap<String, serde_json::Value> =
-                serde_json::from_str(&metadata_json).unwrap_or_default();
-
-            let tags_str: String = row.get("tags");
-            let tags: Vec<String> = if tags_str.is_empty() {
-                Vec::new()
-            } else {
-                tags_str.split(',').map(String::from).collect()
-            };
-
-            let vectorize: i32 = row.get("vectorize");
-            let is_chunk: i32 = row.get("is_chunk");
-            let is_vectorized: i32 = row.get("is_vectorized");
-
-            documents.push(Document {
-                id: row.get("id"),
-                db: db_id.to_string(),
-                table: table_name.to_string(),
-                content: row.get("content"),
-                metadata,
-                tags,
-                vector: None,
-                created_at: row.get("created_at"),
-                updated_at: row.get("updated_at"),
-                is_embedded: false,
-                vectorize: vectorize == 1,
-                is_chunk: is_chunk == 1,
-                parent_id: row.get("parent_id"),
-                chunk_index: row.get("chunk_index"),
-                token_count: row.get("token_count"),
-                is_vectorized: is_vectorized == 1,
-            });
-        }
-
-        Ok(documents)
-    }
-
-    /// Get all documents (embedded or not) - for listing endpoints
-    pub async fn get_all_documents(
-        &mut self,
-        db_id: &str,
-        table_name: &str,
-        limit: i32,
-    ) -> Result<Vec<Document>> {
-        let pool = self.get_pool(db_id).await?;
-
-        let query = format!(
-            r#"
-            SELECT id, content, metadata, tags, vector, created_at, updated_at, is_embedded, vectorize, is_chunk, parent_id, chunk_index, token_count, is_vectorized
-            FROM "{}"
-            ORDER BY created_at ASC
-            LIMIT ?
-        "#,
-            table_name
-        );
-
-        let rows = sqlx::query(sqlx::AssertSqlSafe(query))
-            .bind(limit)
-            .fetch_all(pool)
-            .await?;
-
-        let mut documents = Vec::new();
-        for row in rows {
-            let metadata_json: String = row.get("metadata");
-            let metadata: HashMap<String, serde_json::Value> =
-                serde_json::from_str(&metadata_json).unwrap_or_default();
-
-            let tags_str: String = row.get("tags");
-            let tags: Vec<String> = if tags_str.is_empty() {
-                Vec::new()
-            } else {
-                tags_str.split(',').map(String::from).collect()
-            };
-
-            let vector_bytes: Option<Vec<u8>> = row.get("vector");
-            let vector = vector_bytes.map(|bytes| deserialize_vector(&bytes));
-
-            let is_embedded: i32 = row.get("is_embedded");
-            let vectorize: i32 = row.get("vectorize");
-            let is_chunk: i32 = row.get("is_chunk");
-            let is_vectorized: i32 = row.get("is_vectorized");
-
-            documents.push(Document {
-                id: row.get("id"),
-                db: db_id.to_string(),
-                table: table_name.to_string(),
-                content: row.get("content"),
-                metadata,
-                tags,
-                vector,
-                created_at: row.get("created_at"),
-                updated_at: row.get("updated_at"),
-                is_embedded: is_embedded == 1,
-                vectorize: vectorize == 1,
-                is_chunk: is_chunk == 1,
-                parent_id: row.get("parent_id"),
-                chunk_index: row.get("chunk_index"),
-                token_count: row.get("token_count"),
-                is_vectorized: is_vectorized == 1,
-            });
-        }
-
-        Ok(documents)
-    }
-
-    /// Update document vector
-    pub async fn update_document_vector(
-        &mut self,
-        db_id: &str,
-        table_name: &str,
-        doc_id: &str,
-        vector: &[f32],
-    ) -> Result<()> {
-        let pool = self.get_pool(db_id).await?;
-        let vector_bytes = serialize_vector(vector);
-
-        let query = format!(
-            r#"
-            UPDATE "{}"
-            SET vector = ?, is_embedded = 1, is_vectorized = 1, updated_at = ?
-            WHERE id = ?
-        "#,
-            table_name
-        );
-
-        sqlx::query(sqlx::AssertSqlSafe(query))
-            .bind(&vector_bytes)
-            .bind(Utc::now())
-            .bind(doc_id)
-            .execute(pool)
-            .await?;
-
-        // Add to vector index if it exists
-        if self.use_indexing {
-            let index_key = format!("{}:{}", db_id, table_name);
-            if let Some(index) = self.indexes.get(&index_key) {
-                index.add(doc_id.to_string(), vector.to_vec())?;
+            sqlx::query("DELETE FROM record_metadata WHERE record_id = ?")
+                .bind(id)
+                .execute(&mut *transaction)
+                .await?;
+            for (key, value) in metadata {
+                sqlx::query(
+                    "INSERT INTO record_metadata(record_id, key, value_json) VALUES (?, ?, ?)",
+                )
+                .bind(id)
+                .bind(key)
+                .bind(serde_json::to_string(value)?)
+                .execute(&mut *transaction)
+                .await?;
+            }
+            for vector in vectors {
+                sqlx::query(
+                    "INSERT INTO vectors(record_id, space, values_blob) VALUES (?, ?, ?) \
+                     ON CONFLICT(record_id, space) DO UPDATE SET values_blob=excluded.values_blob",
+                )
+                .bind(id)
+                .bind(&vector.space)
+                .bind(serialize_vector(&vector.values))
+                .execute(&mut *transaction)
+                .await?;
             }
         }
+        transaction.commit().await?;
 
-        Ok(())
+        let mut records = Vec::with_capacity(prepared.len());
+        for (id, _, _, _) in prepared {
+            records.push(
+                self.get_record(&id)
+                    .await?
+                    .context("record disappeared after commit")?,
+            );
+        }
+        Ok(records)
     }
 
-    /// Build HNSW index for a table
-    async fn build_index(&mut self, db_id: &str, table_name: &str) -> Result<()> {
-        let pool = self.get_pool(db_id).await?;
+    pub async fn get_record(&self, id: &str) -> Result<Option<Record>> {
+        sqlx::query(
+            "SELECT id, payload, metadata, created_at, updated_at FROM records WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?
+        .map(|row| record_from_row(&row))
+        .transpose()
+    }
 
-        tracing::info!("Building HNSW index for {}.{}", db_id, table_name);
+    pub async fn get_vector(&self, record_id: &str, space: &str) -> Result<Option<Vec<f32>>> {
+        let blob: Option<Vec<u8>> =
+            sqlx::query_scalar("SELECT values_blob FROM vectors WHERE record_id = ? AND space = ?")
+                .bind(record_id)
+                .bind(space)
+                .fetch_optional(&self.pool)
+                .await?;
+        blob.map(|blob| deserialize_vector(&blob)).transpose()
+    }
 
-        // Fetch all vectors
-        let sql = format!(
-            r#"
-            SELECT id, vector FROM "{}"
-            WHERE is_embedded = 1 AND vector IS NOT NULL
-        "#,
-            table_name
-        );
+    pub async fn list_records(&self, limit: usize, offset: usize) -> Result<Vec<Record>> {
+        sqlx::query("SELECT id, payload, metadata, created_at, updated_at FROM records ORDER BY id LIMIT ? OFFSET ?")
+            .bind(limit as i64)
+            .bind(offset as i64)
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(|row| record_from_row(&row))
+            .collect()
+    }
 
-        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
-            .fetch_all(pool)
+    pub async fn delete_record(&self, id: &str) -> Result<bool> {
+        let result = sqlx::query("DELETE FROM records WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
             .await?;
+        Ok(result.rows_affected() != 0)
+    }
 
-        if rows.is_empty() {
-            tracing::warn!("No vectors to index for {}.{}", db_id, table_name);
+    pub async fn delete_vector(&self, record_id: &str, space: &str) -> Result<bool> {
+        let result = sqlx::query("DELETE FROM vectors WHERE record_id = ? AND space = ?")
+            .bind(record_id)
+            .bind(space)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() != 0)
+    }
+
+    /// Vector-first nearest-neighbor retrieval. Filters are exact metadata equality constraints.
+    pub async fn search(&self, query: VectorQuery) -> Result<Vec<SearchResult>> {
+        let space = self
+            .get_vector_space(&query.space)
+            .await?
+            .with_context(|| format!("unknown vector space '{}'", query.space))?;
+        validate_vector(&space, &query.vector)?;
+        if query.limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Filtering must be correct even when ANN candidate expansion would be insufficient.
+        if !query.filter.is_empty()
+            || !space.index.enabled
+            || space.distance_metric != DistanceMetric::Cosine
+        {
+            return self.search_exact_with_space(&space, &query).await;
+        }
+
+        self.ensure_fresh_index(&space).await?;
+        let neighbors = {
+            let indexes = self.indexes.read().await;
+            indexes
+                .get(&space.name)
+                .context("index was not loaded")?
+                .search(&query.vector, query.limit)
+        };
+        let mut results = Vec::with_capacity(neighbors.len());
+        for (id, ann_distance) in neighbors {
+            if let Some(record) = self.get_record(&id).await? {
+                results.push(SearchResult {
+                    record,
+                    distance: ann_distance,
+                });
+            }
+        }
+        Ok(results)
+    }
+
+    /// Exhaustive retrieval, useful for correctness checks and filtered queries.
+    pub async fn search_exact(&self, query: VectorQuery) -> Result<Vec<SearchResult>> {
+        let space = self
+            .get_vector_space(&query.space)
+            .await?
+            .with_context(|| format!("unknown vector space '{}'", query.space))?;
+        validate_vector(&space, &query.vector)?;
+        self.search_exact_with_space(&space, &query).await
+    }
+
+    async fn search_exact_with_space(
+        &self,
+        space: &VectorSpace,
+        query: &VectorQuery,
+    ) -> Result<Vec<SearchResult>> {
+        let mut statement = QueryBuilder::<Sqlite>::new(
+            "SELECT r.id, r.payload, r.metadata, r.created_at, r.updated_at, v.values_blob \
+             FROM vectors v JOIN records r ON r.id = v.record_id WHERE v.space = ",
+        );
+        statement.push_bind(&space.name);
+        if !query.filter.is_empty() {
+            statement.push(" AND v.record_id IN (SELECT record_id FROM record_metadata WHERE ");
+            for (position, (key, value)) in query.filter.equals.iter().enumerate() {
+                if position != 0 {
+                    statement.push(" OR ");
+                }
+                statement
+                    .push("(key = ")
+                    .push_bind(key)
+                    .push(" AND value_json = ")
+                    .push_bind(serde_json::to_string(value)?)
+                    .push(")");
+            }
+            statement
+                .push(" GROUP BY record_id HAVING COUNT(*) = ")
+                .push_bind(query.filter.equals.len() as i64)
+                .push(")");
+        }
+        let rows = statement.build().fetch_all(&self.pool).await?;
+        let mut results = Vec::new();
+        for row in rows {
+            let record = record_from_row(&row)?;
+            if !query.filter.matches(&record.metadata) {
+                continue;
+            }
+            let blob: Vec<u8> = row.try_get("values_blob")?;
+            let vector = deserialize_vector(&blob)?;
+            results.push(SearchResult {
+                distance: distance(space.distance_metric, &query.vector, &vector),
+                record,
+            });
+        }
+        results.sort_by(|left, right| {
+            left.distance
+                .total_cmp(&right.distance)
+                .then_with(|| left.record.id.cmp(&right.record.id))
+        });
+        results.truncate(query.limit);
+        Ok(results)
+    }
+
+    /// Rebuilds derived ANN state and atomically swaps it into use when complete.
+    pub async fn rebuild_index(&self, space_name: &str) -> Result<IndexStatus> {
+        let space = self
+            .get_vector_space(space_name)
+            .await?
+            .with_context(|| format!("unknown vector space '{space_name}'"))?;
+        if !space.index.enabled {
+            anyhow::bail!("indexing is disabled for vector space '{space_name}'");
+        }
+        if space.distance_metric != DistanceMetric::Cosine {
+            anyhow::bail!(
+                "HNSW currently supports cosine vector spaces; exact search remains available"
+            );
+        }
+        self.build_current_index(&space).await?;
+        self.index_status(space_name).await
+    }
+
+    /// Drops only process-local derived state. Persisted records and vectors are untouched.
+    pub async fn drop_index(&self, space_name: &str) {
+        self.indexes.write().await.remove(space_name);
+    }
+
+    pub async fn index_status(&self, space_name: &str) -> Result<IndexStatus> {
+        let database_generation = self.generation(space_name).await?;
+        let indexes = self.indexes.read().await;
+        let loaded = indexes.get(space_name);
+        let loaded_generation = loaded.map(VectorIndex::generation);
+        Ok(IndexStatus {
+            space: space_name.to_owned(),
+            database_generation,
+            loaded_generation,
+            indexed_vectors: loaded.map_or(0, VectorIndex::len),
+            stale: loaded_generation.is_some_and(|generation| generation != database_generation),
+        })
+    }
+
+    pub async fn create_relation(&self, input: RelationInput) -> Result<Relation> {
+        let relation = Relation {
+            id: input.id.unwrap_or_else(|| Uuid::new_v4().to_string()),
+            source_id: input.source_id,
+            target_id: input.target_id,
+            kind: input.kind,
+            metadata: input.metadata,
+            created_at: Utc::now(),
+        };
+        if relation.id.is_empty() || relation.kind.is_empty() {
+            anyhow::bail!("relation id and kind cannot be empty");
+        }
+        sqlx::query("INSERT INTO relations(id, source_id, target_id, kind, metadata, created_at) VALUES (?, ?, ?, ?, ?, ?)")
+            .bind(&relation.id)
+            .bind(&relation.source_id)
+            .bind(&relation.target_id)
+            .bind(&relation.kind)
+            .bind(serde_json::to_string(&relation.metadata)?)
+            .bind(relation.created_at)
+            .execute(&self.pool)
+            .await?;
+        Ok(relation)
+    }
+
+    pub async fn delete_relation(&self, id: &str) -> Result<bool> {
+        Ok(sqlx::query("DELETE FROM relations WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?
+            .rows_affected()
+            != 0)
+    }
+
+    pub async fn relations_for(&self, record_id: &str) -> Result<Vec<Relation>> {
+        sqlx::query("SELECT id, source_id, target_id, kind, metadata, created_at FROM relations WHERE source_id = ? OR target_id = ? ORDER BY created_at, id")
+            .bind(record_id)
+            .bind(record_id)
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(relation_from_row)
+            .collect()
+    }
+
+    pub async fn all_relations(&self) -> Result<Vec<Relation>> {
+        sqlx::query("SELECT id, source_id, target_id, kind, metadata, created_at FROM relations ORDER BY created_at, id")
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(relation_from_row)
+            .collect()
+    }
+
+    async fn ensure_fresh_index(&self, space: &VectorSpace) -> Result<()> {
+        let generation = self.generation(&space.name).await?;
+        if self
+            .indexes
+            .read()
+            .await
+            .get(&space.name)
+            .is_some_and(|index| index.generation() == generation)
+        {
             return Ok(());
         }
-
-        let mut documents = Vec::new();
-        let mut dimensions = 0;
-
-        for row in rows {
-            let id: String = row.get("id");
-            let vector_bytes: Vec<u8> = row.get("vector");
-            let vector = deserialize_vector(&vector_bytes);
-            if dimensions == 0 {
-                dimensions = vector.len();
-            }
-            documents.push((id, vector));
-        }
-
-        // Create and build index
-        let index = Arc::new(VectorIndex::new(dimensions, self.index_config.clone()));
-
-        index.build(documents)?;
-
-        let index_key = format!("{}:{}", db_id, table_name);
-        self.indexes.insert(index_key, index);
-
-        tracing::info!("HNSW index built for {}.{}", db_id, table_name);
-
-        Ok(())
+        self.build_current_index(space).await
     }
 
-    /// List all databases
-    pub async fn list_databases(&self) -> Result<Vec<String>> {
-        let data_dir = Path::new(&self.base_dir);
-        let mut databases = Vec::new();
-
-        if !data_dir.exists() {
-            return Ok(databases);
-        }
-
-        let entries = std::fs::read_dir(data_dir)?;
-        for entry in entries {
-            let entry = entry?;
-            let path = entry.path();
-
-            if path.is_file() {
-                if let Some(ext) = path.extension() {
-                    if ext == "db" {
-                        if let Some(stem) = path.file_stem() {
-                            let db_name = stem.to_string_lossy().to_string();
-                            // Skip global.db
-                            if db_name != "global" {
-                                databases.push(db_name);
-                            }
-                        }
-                    }
-                }
+    async fn build_current_index(&self, space: &VectorSpace) -> Result<()> {
+        // If another process writes during a rebuild, retry rather than publishing stale state.
+        for _ in 0..3 {
+            let generation = self.generation(&space.name).await?;
+            let vectors = self.load_vectors(&space.name).await?;
+            let index = VectorIndex::build(space.dimensions, &space.index, generation, vectors)?;
+            if self.generation(&space.name).await? == generation {
+                self.indexes.write().await.insert(space.name.clone(), index);
+                return Ok(());
             }
         }
-
-        databases.sort();
-        Ok(databases)
-    }
-
-    /// List all tables in a database
-    pub async fn list_tables(&mut self, db_id: &str) -> Result<Vec<String>> {
-        let pool = self.get_pool(db_id).await?;
-
-        let rows = sqlx::query(
-            r#"
-            SELECT name FROM sqlite_master
-            WHERE type = 'table'
-            AND name NOT LIKE 'sqlite_%'
-            AND name NOT LIKE '%_fts'
-            AND name NOT LIKE '%_config'
-            AND name NOT LIKE '%_data'
-            AND name NOT LIKE '%_idx'
-            AND name NOT LIKE '%_docsize'
-            ORDER BY name
-            "#,
+        anyhow::bail!(
+            "vector space '{}' changed repeatedly while rebuilding its index",
+            space.name
         )
-        .fetch_all(pool)
+    }
+
+    async fn load_vectors(&self, space: &str) -> Result<Vec<(String, Vec<f32>)>> {
+        let rows = sqlx::query(
+            "SELECT record_id, values_blob FROM vectors WHERE space = ? ORDER BY record_id",
+        )
+        .bind(space)
+        .fetch_all(&self.pool)
         .await?;
-
-        let tables: Vec<String> = rows.iter().map(|row| row.get("name")).collect();
-
-        Ok(tables)
+        rows.into_iter()
+            .map(|row| {
+                let id: String = row.try_get("record_id")?;
+                let blob: Vec<u8> = row.try_get("values_blob")?;
+                Ok((id, deserialize_vector(&blob)?))
+            })
+            .collect()
     }
 
-    /// FTS5 full-text search
-    pub async fn search_fts(
-        &mut self,
-        db_id: &str,
-        table_name: &str,
-        query: &str,
-        limit: usize,
-    ) -> Result<
-        Vec<(
-            String,
-            String,
-            HashMap<String, serde_json::Value>,
-            f64,
-            bool,
-            Option<String>,
-            Option<i32>,
-        )>,
-    > {
-        let pool = self.get_pool(db_id).await?;
+    async fn generation(&self, space: &str) -> Result<i64> {
+        sqlx::query_scalar("SELECT generation FROM vector_spaces WHERE name = ?")
+            .bind(space)
+            .fetch_optional(&self.pool)
+            .await?
+            .with_context(|| format!("unknown vector space '{space}'"))
+    }
 
-        let _fts_table = format!("{}_fts", table_name);
-        let sql = format!(
-            r#"
-            SELECT d.id, d.content, d.metadata, fts.rank, d.is_chunk, d.parent_id, d.chunk_index
-            FROM "{0}_fts" AS fts
-            JOIN "{0}" AS d ON fts.rowid = d.rowid
-            WHERE fts.content MATCH ?
-            ORDER BY fts.rank
-            LIMIT ?
-        "#,
-            table_name
+    async fn space_map(&self) -> Result<HashMap<String, VectorSpace>> {
+        Ok(self
+            .list_vector_spaces()
+            .await?
+            .into_iter()
+            .map(|space| (space.name.clone(), space))
+            .collect())
+    }
+}
+
+fn validate_space(space: &VectorSpace) -> Result<()> {
+    if space.name.is_empty() {
+        anyhow::bail!("vector space name cannot be empty");
+    }
+    if space.dimensions == 0 {
+        anyhow::bail!("vector space dimensions must be greater than zero");
+    }
+    validate_index_config(&space.index)?;
+    Ok(())
+}
+
+fn validate_index_config(config: &crate::IndexConfig) -> Result<()> {
+    if !(2..=64).contains(&config.hnsw_m) {
+        anyhow::bail!("hnsw_m must be between 2 and 64");
+    }
+    if config.hnsw_ef_construction == 0 || config.hnsw_ef_search == 0 {
+        anyhow::bail!("HNSW ef values must be greater than zero");
+    }
+    Ok(())
+}
+
+fn validate_vector(space: &VectorSpace, values: &[f32]) -> Result<()> {
+    if values.len() != space.dimensions {
+        anyhow::bail!(
+            "vector for space '{}' has {} dimensions; expected {}",
+            space.name,
+            values.len(),
+            space.dimensions
         );
-
-        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
-            .bind(query)
-            .bind(limit as i64)
-            .fetch_all(pool)
-            .await?;
-
-        let mut results = Vec::new();
-        for row in rows {
-            let id: String = row.get("id");
-            let content: String = row.get("content");
-            let metadata_json: String = row.get("metadata");
-            let rank: f64 = row.get("rank");
-            let is_chunk: i32 = row.get("is_chunk");
-            let parent_id: Option<String> = row.get("parent_id");
-            let chunk_index: Option<i32> = row.get("chunk_index");
-
-            let metadata: HashMap<String, serde_json::Value> =
-                serde_json::from_str(&metadata_json).unwrap_or_default();
-
-            results.push((
-                id,
-                content,
-                metadata,
-                rank,
-                is_chunk == 1,
-                parent_id,
-                chunk_index,
-            ));
-        }
-
-        Ok(results)
     }
-
-    /// Vector similarity search (cosine distance)
-    /// Uses HNSW index if available and enabled, otherwise falls back to brute-force
-    pub async fn search_vector(
-        &mut self,
-        db_id: &str,
-        table_name: &str,
-        query_vector: &[f32],
-        limit: usize,
-    ) -> Result<
-        Vec<(
-            String,
-            String,
-            HashMap<String, serde_json::Value>,
-            f64,
-            bool,
-            Option<String>,
-            Option<i32>,
-        )>,
-    > {
-        // Check if we should use HNSW index
-        let use_index = self.should_use_index(db_id, table_name).await?;
-
-        if use_index {
-            return self
-                .search_vector_with_index(db_id, table_name, query_vector, limit)
-                .await;
+    if values.iter().any(|value| !value.is_finite()) {
+        anyhow::bail!("vectors must contain only finite values");
+    }
+    if space.normalization == Normalization::Unit {
+        let norm = values.iter().map(|value| value * value).sum::<f32>().sqrt();
+        if (norm - 1.0).abs() > 1e-3 {
+            anyhow::bail!("vector for space '{}' must have unit norm", space.name);
         }
+    }
+    Ok(())
+}
 
-        // Fall back to brute-force
-        self.search_vector_brute_force(db_id, table_name, query_vector, limit)
+fn serialize_vector(values: &[f32]) -> Vec<u8> {
+    values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect()
+}
+
+fn deserialize_vector(blob: &[u8]) -> Result<Vec<f32>> {
+    if !blob.len().is_multiple_of(4) {
+        anyhow::bail!("corrupt persisted vector: byte length is not divisible by four");
+    }
+    Ok(blob
+        .chunks_exact(4)
+        .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+        .collect())
+}
+
+fn vector_space_from_row(row: SqliteRow) -> Result<VectorSpace> {
+    let dimensions: i64 = row.try_get("dimensions")?;
+    Ok(VectorSpace {
+        name: row.try_get("name")?,
+        dimensions: usize::try_from(dimensions).context("invalid persisted vector dimensions")?,
+        distance_metric: DistanceMetric::parse(row.try_get("distance_metric")?)?,
+        normalization: Normalization::parse(row.try_get("normalization")?)?,
+        index: serde_json::from_str(row.try_get("index_config")?)?,
+    })
+}
+
+fn record_from_row(row: &SqliteRow) -> Result<Record> {
+    let payload: Option<String> = row.try_get("payload")?;
+    let metadata: String = row.try_get("metadata")?;
+    Ok(Record {
+        id: row.try_get("id")?,
+        payload: payload
+            .map(|value| serde_json::from_str(&value))
+            .transpose()?,
+        metadata: serde_json::from_str(&metadata)?,
+        created_at: row.try_get::<DateTime<Utc>, _>("created_at")?,
+        updated_at: row.try_get::<DateTime<Utc>, _>("updated_at")?,
+    })
+}
+
+fn relation_from_row(row: SqliteRow) -> Result<Relation> {
+    let metadata: String = row.try_get("metadata")?;
+    Ok(Relation {
+        id: row.try_get("id")?,
+        source_id: row.try_get("source_id")?,
+        target_id: row.try_get("target_id")?,
+        kind: row.try_get("kind")?,
+        metadata: serde_json::from_str(&metadata)?,
+        created_at: row.try_get("created_at")?,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    async fn database() -> (tempfile::TempDir, Database) {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(directory.path().join("test.db"))
             .await
+            .unwrap();
+        database
+            .create_vector_space(VectorSpace {
+                name: "semantic".into(),
+                dimensions: 3,
+                distance_metric: DistanceMetric::Cosine,
+                normalization: Normalization::Unit,
+                index: Default::default(),
+            })
+            .await
+            .unwrap();
+        (directory, database)
     }
 
-    /// Check if we should use HNSW index
-    async fn should_use_index(&mut self, db_id: &str, table_name: &str) -> Result<bool> {
-        if !self.use_indexing {
-            return Ok(false);
+    fn input(id: &str, vector: [f32; 3], category: &str) -> RecordInput {
+        RecordInput {
+            id: Some(id.into()),
+            payload: Some(json!({"text": id})),
+            metadata: HashMap::from([("category".into(), json!(category))]),
+            vectors: vec![NamedVector {
+                space: "semantic".into(),
+                values: vector.to_vec(),
+            }],
         }
-
-        // Get document count
-        let pool = self.get_pool(db_id).await?;
-        let count_query = format!(
-            r#"
-            SELECT COUNT(*) as count FROM "{}" WHERE is_embedded = 1
-        "#,
-            table_name
-        );
-
-        let row = sqlx::query(sqlx::AssertSqlSafe(count_query))
-            .fetch_one(pool)
-            .await?;
-        let count: i64 = row.get("count");
-
-        Ok(count as usize >= self.index_threshold)
     }
 
-    /// Search using HNSW index
-    async fn search_vector_with_index(
-        &mut self,
-        db_id: &str,
-        table_name: &str,
-        query_vector: &[f32],
-        limit: usize,
-    ) -> Result<
-        Vec<(
-            String,
-            String,
-            HashMap<String, serde_json::Value>,
-            f64,
-            bool,
-            Option<String>,
-            Option<i32>,
-        )>,
-    > {
-        let index_key = format!("{}:{}", db_id, table_name);
+    #[tokio::test]
+    async fn exact_search_and_filtering_are_correct() {
+        let (_directory, database) = database().await;
+        database
+            .put_records(vec![
+                input("a", [1.0, 0.0, 0.0], "x"),
+                input("b", [0.0, 1.0, 0.0], "y"),
+            ])
+            .await
+            .unwrap();
+        let results = database
+            .search(VectorQuery {
+                space: "semantic".into(),
+                vector: vec![1.0, 0.0, 0.0],
+                limit: 10,
+                filter: MetadataFilter {
+                    equals: HashMap::from([("category".into(), json!("x"))]),
+                },
+            })
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].record.id, "a");
+        assert!(results[0].distance.abs() < 1e-6);
+    }
 
-        // Build index if not exists
-        if !self.indexes.contains_key(&index_key) {
-            self.build_index(db_id, table_name).await?;
-        }
+    #[tokio::test]
+    async fn updates_deletes_and_rebuilds_keep_stable_ids() {
+        let (_directory, database) = database().await;
+        database
+            .put_record(input("stable", [1.0, 0.0, 0.0], "old"))
+            .await
+            .unwrap();
+        database.rebuild_index("semantic").await.unwrap();
+        database
+            .put_record(input("stable", [0.0, 1.0, 0.0], "new"))
+            .await
+            .unwrap();
+        assert!(database.index_status("semantic").await.unwrap().stale);
+        let results = database
+            .search(VectorQuery {
+                space: "semantic".into(),
+                vector: vec![0.0, 1.0, 0.0],
+                limit: 1,
+                filter: Default::default(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(results[0].record.id, "stable");
+        assert!(!database.index_status("semantic").await.unwrap().stale);
+        database.drop_index("semantic").await;
+        assert!(database.get_record("stable").await.unwrap().is_some());
+        assert!(database.delete_record("stable").await.unwrap());
+        assert!(database
+            .search(VectorQuery {
+                space: "semantic".into(),
+                vector: vec![0.0, 1.0, 0.0],
+                limit: 1,
+                filter: Default::default()
+            })
+            .await
+            .unwrap()
+            .is_empty());
+    }
 
-        // Search using index
-        let index = self
-            .indexes
-            .get(&index_key)
-            .ok_or_else(|| anyhow::anyhow!("Index not found"))?;
+    #[tokio::test]
+    async fn separate_process_handles_detect_stale_indexes_and_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("shared.db");
+        let first = Database::open(&path).await.unwrap();
+        first
+            .create_vector_space(VectorSpace {
+                name: "semantic".into(),
+                dimensions: 3,
+                distance_metric: DistanceMetric::Cosine,
+                normalization: Normalization::Unit,
+                index: Default::default(),
+            })
+            .await
+            .unwrap();
+        first
+            .put_record(input("a", [1.0, 0.0, 0.0], "x"))
+            .await
+            .unwrap();
+        first.rebuild_index("semantic").await.unwrap();
+        let second = Database::open(&path).await.unwrap();
+        second
+            .put_record(input("b", [0.0, 1.0, 0.0], "x"))
+            .await
+            .unwrap();
+        assert!(first.index_status("semantic").await.unwrap().stale);
+        let found = first
+            .search(VectorQuery {
+                space: "semantic".into(),
+                vector: vec![0.0, 1.0, 0.0],
+                limit: 1,
+                filter: Default::default(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(found[0].record.id, "b");
+        drop(first);
+        let reopened = Database::open(&path).await.unwrap();
+        assert_eq!(reopened.get_record("a").await.unwrap().unwrap().id, "a");
+    }
 
-        let neighbors = index.search(query_vector, limit)?;
-
-        // Fetch document details
-        let pool = self.get_pool(db_id).await?;
-        let mut results = Vec::new();
-
-        for (doc_id, similarity) in neighbors {
-            let query = format!(
-                r#"
-                SELECT id, content, metadata, is_chunk, parent_id, chunk_index FROM "{}"
-                WHERE id = ?
-            "#,
-                table_name
-            );
-
-            if let Ok(row) = sqlx::query(sqlx::AssertSqlSafe(query))
-                .bind(&doc_id)
-                .fetch_one(pool)
-                .await
-            {
-                let content: String = row.get("content");
-                let metadata_json: String = row.get("metadata");
-                let metadata: HashMap<String, serde_json::Value> =
-                    serde_json::from_str(&metadata_json).unwrap_or_default();
-                let is_chunk: i32 = row.get("is_chunk");
-                let parent_id: Option<String> = row.get("parent_id");
-                let chunk_index: Option<i32> = row.get("chunk_index");
-
-                results.push((
-                    doc_id,
-                    content,
-                    metadata,
-                    similarity as f64,
-                    is_chunk == 1,
-                    parent_id,
-                    chunk_index,
-                ));
+    #[tokio::test]
+    async fn competing_writers_complete_under_wal() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("writers.db");
+        let first = Database::open(&path).await.unwrap();
+        first
+            .create_vector_space(VectorSpace {
+                name: "semantic".into(),
+                dimensions: 3,
+                distance_metric: DistanceMetric::Cosine,
+                normalization: Normalization::Unit,
+                index: Default::default(),
+            })
+            .await
+            .unwrap();
+        let second = Database::open(&path).await.unwrap();
+        let left = tokio::spawn(async move {
+            for n in 0..25 {
+                first
+                    .put_record(input(&format!("left-{n}"), [1.0, 0.0, 0.0], "x"))
+                    .await
+                    .unwrap();
             }
-        }
-
-        tracing::debug!("HNSW search returned {} results", results.len());
-        Ok(results)
+        });
+        let right = tokio::spawn(async move {
+            for n in 0..25 {
+                second
+                    .put_record(input(&format!("right-{n}"), [0.0, 1.0, 0.0], "x"))
+                    .await
+                    .unwrap();
+            }
+        });
+        left.await.unwrap();
+        right.await.unwrap();
+        let reopened = Database::open(&path).await.unwrap();
+        assert_eq!(reopened.list_records(100, 0).await.unwrap().len(), 50);
     }
 
-    /// Brute-force vector search
-    async fn search_vector_brute_force(
-        &mut self,
-        db_id: &str,
-        table_name: &str,
-        query_vector: &[f32],
-        limit: usize,
-    ) -> Result<
-        Vec<(
-            String,
-            String,
-            HashMap<String, serde_json::Value>,
-            f64,
-            bool,
-            Option<String>,
-            Option<i32>,
-        )>,
-    > {
-        let pool = self.get_pool(db_id).await?;
-
-        let sql = format!(
-            r#"
-            SELECT id, content, metadata, vector, is_chunk, parent_id, chunk_index
-            FROM "{}"
-            WHERE is_embedded = 1 AND vector IS NOT NULL
-        "#,
-            table_name
-        );
-
-        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
-            .fetch_all(pool)
-            .await?;
-
-        let mut results = Vec::new();
-        for row in rows {
-            let id: String = row.get("id");
-            let content: String = row.get("content");
-            let metadata_json: String = row.get("metadata");
-            let vector_bytes: Vec<u8> = row.get("vector");
-            let is_chunk: i32 = row.get("is_chunk");
-            let parent_id: Option<String> = row.get("parent_id");
-            let chunk_index: Option<i32> = row.get("chunk_index");
-
-            let metadata: HashMap<String, serde_json::Value> =
-                serde_json::from_str(&metadata_json).unwrap_or_default();
-
-            // Deserialize vector
-            let doc_vector = deserialize_vector(&vector_bytes);
-
-            // Calculate cosine similarity
-            let similarity = cosine_similarity(query_vector, &doc_vector);
-
-            results.push((
-                id,
-                content,
-                metadata,
-                similarity,
-                is_chunk == 1,
-                parent_id,
-                chunk_index,
-            ));
-        }
-
-        // Sort by similarity (descending)
-        results.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap());
-
-        // Return top results
-        results.truncate(limit);
-
-        Ok(results)
+    #[tokio::test]
+    async fn invalid_batch_rolls_back_before_writing() {
+        let (_directory, database) = database().await;
+        let error = database
+            .put_records(vec![
+                input("ok", [1.0, 0.0, 0.0], "x"),
+                input("bad", [2.0, 0.0, 0.0], "x"),
+            ])
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("unit norm"));
+        assert!(database.get_record("ok").await.unwrap().is_none());
     }
 
-    // ===== Document Relations Methods =====
+    #[tokio::test]
+    async fn vector_space_contracts_and_metrics_are_enforced() {
+        let (_directory, database) = database().await;
+        let invalid = input("wrong-dimensions", [1.0, 0.0, 0.0], "x");
+        let mut invalid = invalid;
+        invalid.vectors[0].values.pop();
+        assert!(database
+            .put_record(invalid)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("dimensions"));
 
-    /// Create a document relation
-    pub async fn create_relation(
-        &mut self,
-        db_id: &str,
-        relation: crate::models::DocumentRelation,
-    ) -> Result<()> {
-        let pool = self.get_pool(db_id).await?;
-
-        let metadata_json = serde_json::to_string(&relation.metadata)?;
-
-        sqlx::query(r#"
-            INSERT INTO document_relations (id, source_id, target_id, relation_type, metadata, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-        "#)
-        .bind(&relation.id)
-        .bind(&relation.source_id)
-        .bind(&relation.target_id)
-        .bind(&relation.relation_type)
-        .bind(&metadata_json)
-        .bind(relation.created_at)
-        .execute(pool)
-        .await?;
-
-        Ok(())
+        database
+            .create_vector_space(VectorSpace {
+                name: "euclidean".into(),
+                dimensions: 2,
+                distance_metric: DistanceMetric::Euclidean,
+                normalization: Normalization::None,
+                index: Default::default(),
+            })
+            .await
+            .unwrap();
+        database
+            .put_records(vec![
+                RecordInput {
+                    id: Some("near".into()),
+                    vectors: vec![NamedVector {
+                        space: "euclidean".into(),
+                        values: vec![1.0, 1.0],
+                    }],
+                    ..Default::default()
+                },
+                RecordInput {
+                    id: Some("far".into()),
+                    vectors: vec![NamedVector {
+                        space: "euclidean".into(),
+                        values: vec![9.0, 9.0],
+                    }],
+                    ..Default::default()
+                },
+            ])
+            .await
+            .unwrap();
+        let result = database
+            .search(VectorQuery {
+                space: "euclidean".into(),
+                vector: vec![0.0, 0.0],
+                limit: 1,
+                filter: Default::default(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(result[0].record.id, "near");
     }
 
-    /// Get relation by ID
-    pub async fn get_relation(
-        &mut self,
-        db_id: &str,
-        relation_id: &str,
-    ) -> Result<crate::models::DocumentRelation> {
-        let pool = self.get_pool(db_id).await?;
-
-        let row = sqlx::query(
-            r#"
-            SELECT id, source_id, target_id, relation_type, metadata, created_at
-            FROM document_relations
-            WHERE id = ?
-        "#,
-        )
-        .bind(relation_id)
-        .fetch_one(pool)
-        .await?;
-
-        let metadata_json: String = row.get("metadata");
-        let metadata = serde_json::from_str(&metadata_json).unwrap_or_default();
-
-        Ok(crate::models::DocumentRelation {
-            id: row.get("id"),
-            source_id: row.get("source_id"),
-            target_id: row.get("target_id"),
-            relation_type: row.get("relation_type"),
-            metadata,
-            created_at: row.get("created_at"),
-        })
+    #[tokio::test]
+    async fn index_configuration_changes_invalidate_derived_state() {
+        let (_directory, database) = database().await;
+        database
+            .put_record(input("a", [1.0, 0.0, 0.0], "x"))
+            .await
+            .unwrap();
+        database.rebuild_index("semantic").await.unwrap();
+        let generation = database
+            .index_status("semantic")
+            .await
+            .unwrap()
+            .database_generation;
+        database
+            .update_index_config(
+                "semantic",
+                crate::IndexConfig {
+                    hnsw_ef_search: 200,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let status = database.index_status("semantic").await.unwrap();
+        assert!(status.database_generation > generation);
+        assert_eq!(status.loaded_generation, None);
+        database
+            .search(VectorQuery {
+                space: "semantic".into(),
+                vector: vec![1.0, 0.0, 0.0],
+                limit: 1,
+                filter: Default::default(),
+            })
+            .await
+            .unwrap();
+        assert!(!database.index_status("semantic").await.unwrap().stale);
     }
 
-    /// Delete a relation
-    pub async fn delete_relation(&mut self, db_id: &str, relation_id: &str) -> Result<()> {
-        let pool = self.get_pool(db_id).await?;
-
-        sqlx::query(
-            r#"
-            DELETE FROM document_relations WHERE id = ?
-        "#,
-        )
-        .bind(relation_id)
-        .execute(pool)
-        .await?;
-
-        Ok(())
-    }
-
-    /// Get all relations for a document
-    pub async fn get_document_relations(
-        &mut self,
-        db_id: &str,
-        doc_id: &str,
-    ) -> Result<Vec<crate::models::DocumentRelation>> {
-        let pool = self.get_pool(db_id).await?;
-
-        let rows = sqlx::query(
-            r#"
-            SELECT id, source_id, target_id, relation_type, metadata, created_at
-            FROM document_relations
-            WHERE source_id = ? OR target_id = ?
-        "#,
-        )
-        .bind(doc_id)
-        .bind(doc_id)
-        .fetch_all(pool)
-        .await?;
-
-        let mut relations = Vec::new();
-        for row in rows {
-            let metadata_json: String = row.get("metadata");
-            let metadata = serde_json::from_str(&metadata_json).unwrap_or_default();
-
-            relations.push(crate::models::DocumentRelation {
-                id: row.get("id"),
-                source_id: row.get("source_id"),
-                target_id: row.get("target_id"),
-                relation_type: row.get("relation_type"),
-                metadata,
-                created_at: row.get("created_at"),
-            });
-        }
-
-        Ok(relations)
-    }
-
-    /// Get all relations in database (for graph operations)
-    pub async fn get_all_relations(
-        &mut self,
-        db_id: &str,
-    ) -> Result<Vec<crate::models::DocumentRelation>> {
-        let pool = self.get_pool(db_id).await?;
-
-        let rows = sqlx::query(
-            r#"
-            SELECT id, source_id, target_id, relation_type, metadata, created_at
-            FROM document_relations
-        "#,
-        )
-        .fetch_all(pool)
-        .await?;
-
-        let mut relations = Vec::new();
-        for row in rows {
-            let metadata_json: String = row.get("metadata");
-            let metadata = serde_json::from_str(&metadata_json).unwrap_or_default();
-
-            relations.push(crate::models::DocumentRelation {
-                id: row.get("id"),
-                source_id: row.get("source_id"),
-                target_id: row.get("target_id"),
-                relation_type: row.get("relation_type"),
-                metadata,
-                created_at: row.get("created_at"),
-            });
-        }
-
-        Ok(relations)
-    }
-
-    // ===== Chunking Methods =====
-
-    /// Get all chunks for a parent document
-    pub async fn get_chunks(
-        &mut self,
-        db_id: &str,
-        table_name: &str,
-        parent_id: &str,
-    ) -> Result<Vec<Document>> {
-        let pool = self.get_pool(db_id).await?;
-
-        let query = format!(
-            r#"
-            SELECT id, content, metadata, tags, vector, created_at, updated_at, is_embedded, 
-                   vectorize, is_chunk, parent_id, chunk_index, token_count, is_vectorized
-            FROM "{}"
-            WHERE parent_id = ? AND is_chunk = 1
-            ORDER BY chunk_index ASC
-        "#,
-            table_name
-        );
-
-        let rows = sqlx::query(sqlx::AssertSqlSafe(query))
-            .bind(parent_id)
-            .fetch_all(pool)
-            .await?;
-
-        let mut documents = Vec::new();
-        for row in rows {
-            let metadata_json: String = row.get("metadata");
-            let metadata = serde_json::from_str(&metadata_json).unwrap_or_default();
-
-            let tags_str: String = row.get("tags");
-            let tags: Vec<String> = if tags_str.is_empty() {
-                Vec::new()
-            } else {
-                tags_str.split(',').map(String::from).collect()
-            };
-
-            let vector_bytes: Option<Vec<u8>> = row.get("vector");
-            let vector = vector_bytes.map(|bytes| deserialize_vector(&bytes));
-
-            let is_embedded: i32 = row.get("is_embedded");
-            let vectorize: i32 = row.get("vectorize");
-            let is_chunk: i32 = row.get("is_chunk");
-            let is_vectorized: i32 = row.get("is_vectorized");
-
-            documents.push(Document {
-                id: row.get("id"),
-                db: db_id.to_string(),
-                table: table_name.to_string(),
-                content: row.get("content"),
-                metadata,
-                tags,
-                vector,
-                created_at: row.get("created_at"),
-                updated_at: row.get("updated_at"),
-                is_embedded: is_embedded == 1,
-                vectorize: vectorize == 1,
-                is_chunk: is_chunk == 1,
-                parent_id: row.get("parent_id"),
-                chunk_index: row.get("chunk_index"),
-                token_count: row.get("token_count"),
-                is_vectorized: is_vectorized == 1,
-            });
-        }
-
-        Ok(documents)
-    }
-
-    /// Delete all chunks for a parent document
-    pub async fn delete_chunks(
-        &mut self,
-        db_id: &str,
-        table_name: &str,
-        parent_id: &str,
-    ) -> Result<()> {
-        let pool = self.get_pool(db_id).await?;
-
-        let query = format!(
-            r#"
-            DELETE FROM "{}"
-            WHERE parent_id = ? AND is_chunk = 1
-        "#,
-            table_name
-        );
-
-        sqlx::query(sqlx::AssertSqlSafe(query))
-            .bind(parent_id)
-            .execute(pool)
-            .await?;
-
-        Ok(())
-    }
-
-    /// Convenience method to add a document from a StoreDocumentRequest
-    /// This provides a cleaner API for adding documents without manually constructing Document structs
-    pub async fn add_document(
-        &mut self,
-        db_id: &str,
-        table_name: &str,
-        request: crate::models::StoreDocumentRequest,
-    ) -> Result<Document> {
-        use uuid::Uuid;
-
-        let doc_id = request.id.unwrap_or_else(|| Uuid::new_v4().to_string());
-
-        let doc = Document {
-            id: doc_id.clone(),
-            db: db_id.to_string(),
-            table: table_name.to_string(),
-            content: request.content,
-            metadata: request.metadata,
-            tags: request.tags,
-            vector: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-            is_embedded: false,
-            vectorize: request.vectorize,
-            is_chunk: false,
-            parent_id: None,
-            chunk_index: None,
-            token_count: None,
-            is_vectorized: false,
+    #[tokio::test]
+    async fn hnsw_recall_tracks_exact_neighbors() {
+        let (_directory, database) = database().await;
+        let records = (0..200)
+            .map(|number| {
+                let angle = number as f32 * std::f32::consts::TAU / 200.0;
+                input(
+                    &format!("point-{number}"),
+                    [angle.cos(), angle.sin(), 0.0],
+                    "x",
+                )
+            })
+            .collect();
+        database.put_records(records).await.unwrap();
+        let query = VectorQuery {
+            space: "semantic".into(),
+            vector: vec![0.0, 1.0, 0.0],
+            limit: 10,
+            filter: Default::default(),
         };
-
-        self.store_document(db_id, table_name, doc.clone()).await?;
-        Ok(doc)
+        let exact: HashSet<_> = database
+            .search_exact(query.clone())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|result| result.record.id)
+            .collect();
+        let approximate = database.search(query).await.unwrap();
+        let recalled = approximate
+            .iter()
+            .filter(|result| exact.contains(&result.record.id))
+            .count();
+        assert!(recalled >= 9, "Recall@10 was {recalled}/10");
     }
 
-    /// Convenience method to add a simple document with just content
-    pub async fn add_simple_document(
-        &mut self,
-        db_id: &str,
-        table_name: &str,
-        content: impl Into<String>,
-    ) -> Result<Document> {
-        let request = crate::models::StoreDocumentRequest {
-            id: None,
-            content: content.into(),
-            metadata: std::collections::HashMap::new(),
-            tags: Vec::new(),
-            vectorize: true,
+    #[tokio::test]
+    async fn process_writer_helper() {
+        let Ok(path) = std::env::var("KUIPERDB_TEST_WRITER_PATH") else {
+            return;
         };
-        self.add_document(db_id, table_name, request).await
-    }
-
-    /// Convenience method to delete a document by ID
-    pub async fn delete_document_by_id(
-        &mut self,
-        db_id: &str,
-        table_name: &str,
-        doc_id: &str,
-    ) -> Result<()> {
-        let pool = self.get_pool(db_id).await?;
-
-        // First, check if this is a child document (has parent_id)
-        let check_query = format!(r#"SELECT parent_id FROM "{}" WHERE id = ?"#, table_name);
-
-        let result: Option<(Option<String>,)> = sqlx::query_as(sqlx::AssertSqlSafe(check_query))
-            .bind(doc_id)
-            .fetch_optional(pool)
-            .await?;
-
-        if let Some((Some(_parent_id),)) = result {
-            return Err(anyhow::anyhow!(
-                "Cannot delete child document. Delete the parent document instead, which will cascade delete all children."
-            ));
+        let mode = std::env::var("KUIPERDB_TEST_WRITER_MODE").unwrap();
+        let database = Database::open(path).await.unwrap();
+        if mode == "crash" {
+            let mut connection = database.pool().acquire().await.unwrap();
+            sqlx::query("BEGIN IMMEDIATE")
+                .execute(&mut *connection)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO records(id, metadata, created_at, updated_at) VALUES ('uncommitted', '{}', datetime('now'), datetime('now'))")
+                .execute(&mut *connection).await.unwrap();
+            std::process::exit(17);
         }
-
-        // Document is a parent or standalone - proceed with deletion
-        // CASCADE will automatically delete children
-        let query = format!(r#"DELETE FROM "{}" WHERE id = ?"#, table_name);
-        sqlx::query(sqlx::AssertSqlSafe(query))
-            .bind(doc_id)
-            .execute(pool)
-            .await?;
-
-        Ok(())
-    }
-
-    pub async fn delete_table(&mut self, db_id: &str, table_name: &str) -> Result<()> {
-        if !is_valid_table_name(table_name) {
-            anyhow::bail!("Invalid table name: {}", table_name);
+        for number in 0..20 {
+            database
+                .put_record(input(
+                    &format!("{mode}-{number}"),
+                    [1.0, 0.0, 0.0],
+                    "process",
+                ))
+                .await
+                .unwrap();
         }
-
-        let pool = self.get_pool(db_id).await?;
-
-        // Drop the main table
-        let drop_table = format!(r#"DROP TABLE IF EXISTS "{}""#, table_name);
-        sqlx::query(sqlx::AssertSqlSafe(drop_table))
-            .execute(pool)
-            .await?;
-
-        // Drop the FTS table
-        let drop_fts = format!(r#"DROP TABLE IF EXISTS "{}_fts""#, table_name);
-        sqlx::query(sqlx::AssertSqlSafe(drop_fts))
-            .execute(pool)
-            .await?;
-
-        Ok(())
     }
 
-    pub async fn delete_database(&mut self, db_id: &str) -> Result<()> {
-        // Remove pool from cache
-        self.pools.remove(db_id);
+    #[tokio::test]
+    async fn competing_process_writers_and_crash_recovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("processes.db");
+        let database = Database::open(&path).await.unwrap();
+        database
+            .create_vector_space(VectorSpace {
+                name: "semantic".into(),
+                dimensions: 3,
+                distance_metric: DistanceMetric::Cosine,
+                normalization: Normalization::Unit,
+                index: Default::default(),
+            })
+            .await
+            .unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let spawn = |mode: &str| {
+            std::process::Command::new(&executable)
+                .args([
+                    "--exact",
+                    "store::tests::process_writer_helper",
+                    "--nocapture",
+                ])
+                .env("KUIPERDB_TEST_WRITER_PATH", &path)
+                .env("KUIPERDB_TEST_WRITER_MODE", mode)
+                .spawn()
+                .unwrap()
+        };
+        let left = spawn("left");
+        let right = spawn("right");
+        assert!(left.wait_with_output().unwrap().status.success());
+        assert!(right.wait_with_output().unwrap().status.success());
+        assert_eq!(database.list_records(100, 0).await.unwrap().len(), 40);
 
-        // Delete the database file
-        let db_path = format!("{}/{}.db", self.base_dir, db_id);
-        if std::path::Path::new(&db_path).exists() {
-            std::fs::remove_file(&db_path).context("Failed to delete database file")?;
-        }
-
-        Ok(())
+        let crashed = spawn("crash").wait_with_output().unwrap();
+        assert_eq!(crashed.status.code(), Some(17));
+        let reopened = Database::open(&path).await.unwrap();
+        assert!(reopened.get_record("uncommitted").await.unwrap().is_none());
+        reopened
+            .put_record(input("after-crash", [1.0, 0.0, 0.0], "process"))
+            .await
+            .unwrap();
     }
-}
-
-/// Serialize vector to bytes (little-endian Float32)
-fn serialize_vector(vector: &[f32]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(vector.len() * 4);
-    for &v in vector {
-        bytes.extend_from_slice(&v.to_le_bytes());
-    }
-    bytes
-}
-
-/// Deserialize vector from bytes
-fn deserialize_vector(bytes: &[u8]) -> Vec<f32> {
-    let mut vector = Vec::with_capacity(bytes.len() / 4);
-    for chunk in bytes.chunks_exact(4) {
-        let value = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-        vector.push(value);
-    }
-    vector
-}
-
-/// Calculate cosine similarity between two vectors
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f64 {
-    if a.len() != b.len() {
-        return 0.0;
-    }
-
-    let mut dot_product = 0.0;
-    let mut norm_a = 0.0;
-    let mut norm_b = 0.0;
-
-    for i in 0..a.len() {
-        dot_product += (a[i] * b[i]) as f64;
-        norm_a += (a[i] * a[i]) as f64;
-        norm_b += (b[i] * b[i]) as f64;
-    }
-
-    if norm_a == 0.0 || norm_b == 0.0 {
-        return 0.0;
-    }
-
-    dot_product / (norm_a.sqrt() * norm_b.sqrt())
-}
-
-/// Validate table name (alphanumeric and underscores only)
-fn is_valid_table_name(name: &str) -> bool {
-    !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_')
 }

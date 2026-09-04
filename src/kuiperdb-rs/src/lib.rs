@@ -1,12 +1,14 @@
-//! KuiperDb Client Library
+//! KuiperDB HTTP client.
 //!
 //! HTTP client for connecting to KuiperDb REST API servers.
 
 mod client;
 
 pub use client::Client;
-pub use kuiperdb_core::search::SearchResult;
-pub use kuiperdb_core::{Document, GraphStatistics};
+pub use kuiperdb_core::{
+    DistanceMetric, IndexConfig, Metadata, MetadataFilter, NamedVector, Normalization, Record,
+    RecordInput, Relation, RelationInput, SearchResult, VectorQuery, VectorSpace,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {

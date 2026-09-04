@@ -1,97 +1,69 @@
-/**
- * KuiperDb TypeScript Client - Type Definitions
- */
+export type Metadata = Record<string, unknown>;
 
-export interface Document {
-  id: string;
-  db: string;
-  table: string;
-  content: string;
-  metadata: Record<string, any>;
-  tags: string[];
-  parent_id?: string | null;
-  chunk_index?: number;
-  created_at: number;
-  updated_at: number;
-  token_count?: number;
-  is_vectorized: boolean;
+export interface IndexConfig {
+  enabled: boolean;
+  hnsw_m: number;
+  hnsw_ef_construction: number;
+  hnsw_ef_search: number;
 }
 
-export interface DocumentRelation {
-  id: string;
-  source_id: string;
-  target_id: string;
-  relation_type: string;
-  metadata: Record<string, any>;
-  created_at: number;
-}
-
-export interface Database {
+export interface VectorSpace {
   name: string;
+  dimensions: number;
+  distance_metric: 'cosine' | 'euclidean' | 'dot_product';
+  normalization?: 'none' | 'unit';
+  index?: Partial<IndexConfig>;
 }
 
-export interface Table {
-  name: string;
+export interface NamedVector {
+  space: string;
+  values: number[];
 }
 
-export interface SearchRequest {
-  query: string;
-  type?: 'vector' | 'fulltext' | 'hybrid';
+export interface KuiperRecord {
+  id: string;
+  payload?: unknown;
+  metadata: Metadata;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface RecordInput {
+  id?: string;
+  payload?: unknown;
+  metadata?: Metadata;
+  vectors?: NamedVector[];
+}
+
+export interface MetadataFilter { [key: string]: unknown }
+
+export interface VectorQuery {
+  space: string;
+  vector: number[];
   limit?: number;
-  filters?: Record<string, any>;
-  include_chunks?: boolean;
-  group_by_parent?: boolean;
+  filter?: MetadataFilter;
 }
 
 export interface SearchResult {
+  record: KuiperRecord;
+  distance: number;
+}
+
+export interface Relation {
   id: string;
-  content: string;
-  metadata: Record<string, any>;
-  score: number;
-  fts_rank?: number | null;
-  vector_similarity?: number | null;
-  is_chunk: boolean;
-  parent_id?: string | null;
-  chunk_index?: number | null;
-}
-
-export interface GraphTraversalRequest {
-  start_id: string;
-  max_depth: number;
-  relation_types?: string[];
-}
-
-export interface GraphTraversalResult {
-  document_ids: string[];
-  relations: DocumentRelation[];
-  depth_map: Record<string, number>;
-}
-
-export interface GraphStatistics {
-  node_count: number;
-  edge_count: number;
-  has_cycles: boolean;
-  in_degrees: Record<string, number>;
-  out_degrees: Record<string, number>;
-}
-
-export interface CreateRelationRequest {
   source_id: string;
   target_id: string;
-  relation_type: string;
-  metadata?: Record<string, any>;
+  kind: string;
+  metadata: Metadata;
+  created_at: string;
 }
 
-export interface StoreDocumentRequest {
+export interface RelationInput {
   id?: string;
-  content: string;
-  metadata?: Record<string, any>;
-  tags?: string[];
-  vectorize?: boolean;
-}
-
-export interface StoreDocumentOptions {
-  asyncEmbedding?: boolean;
+  source_id: string;
+  target_id: string;
+  kind: string;
+  metadata?: Metadata;
 }
 
 export interface KuiperDbClientConfig {

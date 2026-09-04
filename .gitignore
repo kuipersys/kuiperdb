@@ -24,6 +24,8 @@ target
 
 # Data directory
 data/
+.data/
+.plans/
 
 # Logs directory
 logs/

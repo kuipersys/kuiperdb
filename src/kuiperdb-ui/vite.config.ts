@@ -7,15 +7,15 @@ export default defineConfig({
   server: {
     proxy: {
       '/db': {
-        target: 'http://localhost:8080',
+        target: 'http://localhost:17001',
         changeOrigin: true,
       },
       '/logs': {
-        target: 'http://localhost:8080',
+        target: 'http://localhost:17001',
         changeOrigin: true,
       },
       '/health': {
-        target: 'http://localhost:8080',
+        target: 'http://localhost:17001',
         changeOrigin: true,
       }
     }

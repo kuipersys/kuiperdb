@@ -6,45 +6,20 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
-# Async runtime
 tokio.workspace = true
-async-trait = "0.1"
-
-# Database
 sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite", "chrono"] }
-
-# Serialization
 serde.workspace = true
 serde_json.workspace = true
-
-# Error handling
 anyhow.workspace = true
-thiserror.workspace = true
-
-# Logging
-tracing.workspace = true
-
-# Utilities
 chrono.workspace = true
 uuid.workspace = true
-
-# Caching
-lru = "0.18"
-sha2 = "0.11"
-hex = "0.4"
-
-# Vector index (HNSW)
 hnsw_rs = "0.3"
-
-# Parallel processing
-rayon = "1.12"
-futures = "0.3"
-
-# Tokenization for chunking
-tiktoken-rs = "0.11"
-
-# Graph algorithms
 petgraph = "0.8"
 
-# HTTP client for embeddings
-reqwest = { version = "0.13", features = ["json", "rustls"], default-features = false }
+[dev-dependencies]
+tempfile = "3"
+criterion = { version = "0.7", features = ["async_tokio"] }
+
+[[bench]]
+name = "core"
+harness = false

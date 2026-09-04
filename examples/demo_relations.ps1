@@ -6,7 +6,7 @@ Write-Host "║          KuiperDb DOCUMENT RELATIONS DEMONSTRATION           ║
 Write-Host "╚══════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
 Write-Host ""
 
-$baseUrl = "http://localhost:8080"
+$baseUrl = "http://localhost:17001"
 
 # Get the D&D characters
 Write-Host "Step 1: Getting D&D characters..." -ForegroundColor Yellow

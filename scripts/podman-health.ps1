@@ -87,7 +87,7 @@ function Show-Health {
     # API connectivity test
     Write-Host "`nAPI Connectivity:" -ForegroundColor Yellow
     try {
-        $port = $inspect.NetworkSettings.Ports.'8080/tcp'[0].HostPort
+        $port = $inspect.NetworkSettings.Ports.'17001/tcp'[0].HostPort
         $response = Invoke-WebRequest -Uri "http://localhost:$port" -Method GET -TimeoutSec 5 -ErrorAction Stop
         Write-Host "  Status: Connected (HTTP $($response.StatusCode))" -ForegroundColor Green
     } catch {

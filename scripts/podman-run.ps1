@@ -5,7 +5,7 @@
 .DESCRIPTION
     Runs kuiperdb container with persistent volumes for data and logs, health checks, and auto-restart
 .PARAMETER Port
-    Host port to expose (default: 8080)
+    Host port to expose (default: 17001)
 .PARAMETER DataVolume
     Named volume for persistent data (default: kuiperdb-data)
 .PARAMETER LogsVolume
@@ -23,7 +23,7 @@
 #>
 
 param(
-    [int]$Port = 8080,
+    [int]$Port = 17001,
     [string]$DataVolume = "kuiperdb-data",
     [string]$LogsVolume = "kuiperdb-logs",
     [string]$ContainerName = "kuiperdb",
@@ -56,7 +56,7 @@ foreach ($vol in @($DataVolume, $LogsVolume)) {
 $runArgs = @(
     "run",
     "--name", $ContainerName,
-    "-p", "${Port}:8080",
+    "-p", "${Port}:17001",
     "-v", "${DataVolume}:/app/data:Z",
     "-v", "${LogsVolume}:/app/logs:Z",
     "-e", "RUST_LOG=info",

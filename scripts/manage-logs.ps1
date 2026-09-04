@@ -11,7 +11,7 @@
 .PARAMETER DaysToKeep
     Number of days to keep when cleaning up (default: 30)
 .PARAMETER BaseUrl
-    kuiperdb API base URL (default: http://localhost:8080)
+    kuiperdb API base URL (default: http://localhost:17001)
 .EXAMPLE
     .\manage-logs.ps1 -Action list
 .EXAMPLE
@@ -19,7 +19,7 @@
 .EXAMPLE
     .\manage-logs.ps1 -Action cleanup -DaysToKeep 7
 .EXAMPLE
-    .\manage-logs.ps1 -Action analyze -BaseUrl http://remote-server:8080
+    .\manage-logs.ps1 -Action analyze -BaseUrl http://remote-server:17001
 #>
 
 param(
@@ -27,7 +27,7 @@ param(
     [string]$Action = "list",
     [string]$Date = (Get-Date -Format "yyyy-MM-dd"),
     [int]$DaysToKeep = 30,
-    [string]$BaseUrl = "http://localhost:8080"
+    [string]$BaseUrl = "http://localhost:17001"
 )
 
 $ErrorActionPreference = "Stop"
@@ -214,4 +214,4 @@ Write-Host "  View today:    .\manage-logs.ps1 -Action view" -ForegroundColor Gr
 Write-Host "  View date:     .\manage-logs.ps1 -Action view -Date 2026-02-03" -ForegroundColor Gray
 Write-Host "  Analyze:       .\manage-logs.ps1 -Action analyze" -ForegroundColor Gray
 Write-Host "  Cleanup:       .\manage-logs.ps1 -Action cleanup -DaysToKeep 30" -ForegroundColor Gray
-Write-Host "  Remote server: .\manage-logs.ps1 -Action list -BaseUrl http://server:8080" -ForegroundColor Gray
+Write-Host "  Remote server: .\manage-logs.ps1 -Action list -BaseUrl http://server:17001" -ForegroundColor Gray

@@ -1,5 +1,19 @@
 # KuiperDb Changelog
 
+## Unreleased - Model-agnostic embedded core
+
+- Replaced document-centric storage with stable records, opaque JSON payloads and metadata, and generic relationships.
+- Made caller-supplied vectors the only ingestion and search primitive.
+- Added explicit named vector-space contracts for dimensions, metric, normalization, and HNSW configuration.
+- Removed embedding clients, inference workers, embedding caches, and chunkers from `kuiperdb-core`.
+- Made persisted SQLite vectors authoritative and HNSW process-local, rebuildable derived state.
+- Added persistent index generations and automatic cross-process stale-index rebuilding.
+- Defined WAL, busy-timeout, transaction, crash recovery, and reopening behavior.
+- Added exact/filtered retrieval, ANN recall, lifecycle, concurrent handle/process, and crash tests plus focused benchmarks.
+- Updated the Rust/TypeScript clients, HTTP adapter, examples, container, and explorer to the vector-first API.
+
+This is an intentionally breaking API and storage-model change.
+
 ## v0.1.1 - Rust Workspace Restructure
 
 ### Major Changes

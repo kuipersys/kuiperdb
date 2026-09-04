@@ -25,7 +25,7 @@ interface KuiperDbProviderProps {
  * 
  * function App() {
  *   return (
- *     <KuiperDbProvider baseURL="http://localhost:8080">
+ *     <KuiperDbProvider baseURL="http://localhost:17001">
  *       <YourComponents />
  *     </KuiperDbProvider>
  *   );
@@ -61,9 +61,10 @@ export function KuiperDbProvider({
  * function MyComponent() {
  *   const { client } = useKuiperDb();
  *   
- *   const databases = await client.getDatabases();
- *   const documents = await client.getDocuments(db, table);
- *   // ... etc
+ *   const results = await client.search({
+ *     space: 'semantic',
+ *     vector: [1, 0, 0],
+ *   });
  * }
  * ```
  */

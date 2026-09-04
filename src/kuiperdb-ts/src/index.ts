@@ -2,22 +2,21 @@
  * KuiperDb TypeScript Client
  * 
  * A TypeScript/JavaScript client library for interacting with KuiperDb,
- * a vector database with document relations and graph capabilities.
+ * a model-agnostic vector database.
  */
 
 export { KuiperDbClient, createClient } from './client.js';
 export type {
-  Document,
-  DocumentRelation,
-  Database,
-  Table,
-  SearchRequest,
-  SearchResult,
-  GraphTraversalRequest,
-  GraphTraversalResult,
-  GraphStatistics,
-  CreateRelationRequest,
-  StoreDocumentRequest,
-  StoreDocumentOptions,
+  IndexConfig,
   KuiperDbClientConfig,
+  KuiperRecord,
+  Metadata,
+  MetadataFilter,
+  NamedVector,
+  RecordInput,
+  Relation,
+  RelationInput,
+  SearchResult,
+  VectorQuery,
+  VectorSpace,
 } from './types.js';

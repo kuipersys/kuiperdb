@@ -1,46 +1,59 @@
--- Main documents table
-CREATE TABLE IF NOT EXISTS documents (
-	id TEXT PRIMARY KEY,
-	content TEXT NOT NULL,
-	metadata TEXT, -- JSON
-	tags TEXT, -- Comma-separated tags for filtering
-	vector BLOB, -- Serialized float32 array
-	created_at DATETIME NOT NULL,
-	updated_at DATETIME NOT NULL,
-	is_vectorized INTEGER DEFAULT 0
+-- Reference schema. The executable migration is `SCHEMA` in kuiperdb-core/src/store.rs.
+PRAGMA journal_mode = WAL;
+PRAGMA foreign_keys = ON;
+
+CREATE TABLE IF NOT EXISTS records (
+    id TEXT PRIMARY KEY,
+    payload TEXT,
+    metadata TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
 );
 
--- FTS5 virtual table for full-text search
-CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
-	id UNINDEXED,
-	content,
-	content='documents',
-	content_rowid='rowid'
+CREATE TABLE IF NOT EXISTS vector_spaces (
+    name TEXT PRIMARY KEY,
+    dimensions INTEGER NOT NULL CHECK (dimensions > 0),
+    distance_metric TEXT NOT NULL,
+    normalization TEXT NOT NULL,
+    index_config TEXT NOT NULL,
+    generation INTEGER NOT NULL DEFAULT 0
 );
 
--- Triggers to keep FTS table in sync
-CREATE TRIGGER IF NOT EXISTS documents_ai AFTER INSERT ON documents BEGIN
-	INSERT INTO documents_fts(rowid, id, content)
-	VALUES (new.rowid, new.id, new.content);
+CREATE TABLE IF NOT EXISTS vectors (
+    record_id TEXT NOT NULL REFERENCES records(id) ON DELETE CASCADE,
+    space TEXT NOT NULL REFERENCES vector_spaces(name) ON DELETE CASCADE,
+    values_blob BLOB NOT NULL,
+    PRIMARY KEY (record_id, space)
+);
+
+CREATE TABLE IF NOT EXISTS record_metadata (
+    record_id TEXT NOT NULL REFERENCES records(id) ON DELETE CASCADE,
+    key TEXT NOT NULL,
+    value_json TEXT NOT NULL,
+    PRIMARY KEY (record_id, key)
+);
+
+CREATE TABLE IF NOT EXISTS relations (
+    id TEXT PRIMARY KEY,
+    source_id TEXT NOT NULL REFERENCES records(id) ON DELETE CASCADE,
+    target_id TEXT NOT NULL REFERENCES records(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL,
+    metadata TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_vectors_space ON vectors(space);
+CREATE INDEX IF NOT EXISTS idx_record_metadata_lookup ON record_metadata(key, value_json, record_id);
+CREATE INDEX IF NOT EXISTS idx_relations_source ON relations(source_id);
+CREATE INDEX IF NOT EXISTS idx_relations_target ON relations(target_id);
+
+CREATE TRIGGER IF NOT EXISTS vectors_generation_insert AFTER INSERT ON vectors BEGIN
+    UPDATE vector_spaces SET generation = generation + 1 WHERE name = NEW.space;
 END;
-
-CREATE TRIGGER IF NOT EXISTS documents_ad AFTER DELETE ON documents BEGIN
-	DELETE FROM documents_fts WHERE rowid = old.rowid;
+CREATE TRIGGER IF NOT EXISTS vectors_generation_update AFTER UPDATE ON vectors BEGIN
+    UPDATE vector_spaces SET generation = generation + 1 WHERE name = NEW.space;
+    UPDATE vector_spaces SET generation = generation + 1 WHERE name = OLD.space AND OLD.space <> NEW.space;
 END;
-
-CREATE TRIGGER IF NOT EXISTS documents_au AFTER UPDATE ON documents BEGIN
-	UPDATE documents_fts SET content = new.content WHERE rowid = old.rowid;
+CREATE TRIGGER IF NOT EXISTS vectors_generation_delete AFTER DELETE ON vectors BEGIN
+    UPDATE vector_spaces SET generation = generation + 1 WHERE name = OLD.space;
 END;
-
--- Indexes
-CREATE INDEX IF NOT EXISTS idx_documents_created_at ON documents(created_at);
-CREATE INDEX IF NOT EXISTS idx_documents_updated_at ON documents(updated_at);
-CREATE INDEX IF NOT EXISTS idx_documents_embedded ON documents(is_embedded);
-CREATE INDEX IF NOT EXISTS idx_documents_tags ON documents(tags);
-
--- TODO: Add sqlite-vec extension initialization here
--- SELECT load_extension('vec0');
--- CREATE VIRTUAL TABLE IF NOT EXISTS vec_documents USING vec0(
---     id TEXT PRIMARY KEY,
---     embedding FLOAT[768]  -- Assuming 768-dimensional vectors https://huggingface.co/google/embeddinggemma-300m
--- );

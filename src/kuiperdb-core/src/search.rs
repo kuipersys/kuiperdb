@@ -1,224 +1,43 @@
-use anyhow::Result;
-use serde::{Deserialize, Serialize};
-use sqlx::Error as SqlxError;
-use std::collections::HashMap;
+use crate::DistanceMetric;
 
-use crate::embedder::Embedder;
-use crate::store::DocumentStore;
-
-/// Type alias for search result tuples
-type SearchResultTuple = (
-    String,                             // id
-    String,                             // content
-    HashMap<String, serde_json::Value>, // metadata
-    f64,                                // score
-    bool,                               // is_chunk
-    Option<String>,                     // parent_id
-    Option<i32>,                        // chunk_index
-);
-
-/// Type alias for RRF score accumulator
-type RrfScoreMap = HashMap<
-    String, // document id
-    (
-        f64,                                // combined score
-        Option<f64>,                        // fts_rank
-        Option<f64>,                        // vector_similarity
-        String,                             // content
-        HashMap<String, serde_json::Value>, // metadata
-        bool,                               // is_chunk
-        Option<String>,                     // parent_id
-        Option<i32>,                        // chunk_index
-    ),
->;
-
-/// Hybrid search combining FTS5 and vector similarity
-pub struct HybridSearcher {
-    k: usize, // RRF parameter (typically 60)
+pub(crate) fn distance(metric: DistanceMetric, left: &[f32], right: &[f32]) -> f32 {
+    match metric {
+        DistanceMetric::Cosine => cosine_distance(left, right),
+        DistanceMetric::Euclidean => left
+            .iter()
+            .zip(right)
+            .map(|(a, b)| (a - b).powi(2))
+            .sum::<f32>()
+            .sqrt(),
+        // Negating the dot product makes "lower is nearer" consistent across metrics.
+        DistanceMetric::DotProduct => -left.iter().zip(right).map(|(a, b)| a * b).sum::<f32>(),
+    }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct SearchResult {
-    /// Document ID
-    pub id: String,
-    /// Document contents
-    pub content: String,
-    /// Document metadata
-    pub metadata: HashMap<String, serde_json::Value>,
-    /// Combined RRF score
-    pub score: f64,
-    /// FTS rank
-    pub fts_rank: Option<f64>,
-    /// Vector similarity
-    pub vector_similarity: Option<f64>,
-    /// Chunking fields
-    pub is_chunk: bool,
-    /// Parent document ID if this is a chunk
-    pub parent_id: Option<String>,
-    /// Chunk index if this is a chunk
-    pub chunk_index: Option<i32>,
+fn cosine_distance(left: &[f32], right: &[f32]) -> f32 {
+    let dot = left.iter().zip(right).map(|(a, b)| a * b).sum::<f32>();
+    let left_norm = left.iter().map(|value| value * value).sum::<f32>().sqrt();
+    let right_norm = right.iter().map(|value| value * value).sum::<f32>().sqrt();
+    if left_norm == 0.0 || right_norm == 0.0 {
+        1.0
+    } else {
+        1.0 - dot / (left_norm * right_norm)
+    }
 }
 
-impl HybridSearcher {
-    pub fn new() -> Self {
-        Self { k: 60 }
-    }
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    /// Perform hybrid search combining FTS5 and vector similarity
-    pub async fn search(
-        &self,
-        store: &mut DocumentStore,
-        embedder: Option<&dyn Embedder>,
-        db_id: &str,
-        table_name: &str,
-        query: &str,
-        limit: usize,
-    ) -> Result<Vec<SearchResult>> {
-        // Get FTS5 results
-        let fts_results = match store.search_fts(db_id, table_name, query, limit * 2).await {
-            Ok(rows) => rows,
-            Err(e) => {
-                // If the database or tables are missing, return an empty result set instead of failing
-                if Self::is_missing_table_error(&e) {
-                    return Ok(Vec::new());
-                }
-                return Err(e);
-            }
-        };
-
-        // Get vector results if embedder available
-        let vector_results = if let Some(emb) = embedder {
-            let query_vector = emb.embed(query).await?;
-            match store
-                .search_vector(db_id, table_name, &query_vector, limit * 2)
-                .await
-            {
-                Ok(rows) => rows,
-                Err(e) => {
-                    if Self::is_missing_table_error(&e) {
-                        Vec::new()
-                    } else {
-                        return Err(e);
-                    }
-                }
-            }
-        } else {
-            Vec::new()
-        };
-
-        // Merge with RRF
-        let merged = self.reciprocal_rank_fusion(&fts_results, &vector_results);
-
-        // Return top results
-        Ok(merged.into_iter().take(limit).collect())
-    }
-
-    /// Reciprocal Rank Fusion algorithm
-    /// RRF score = sum(1 / (k + rank))
-    fn reciprocal_rank_fusion(
-        &self,
-        fts_results: &[SearchResultTuple],
-        vector_results: &[SearchResultTuple],
-    ) -> Vec<SearchResult> {
-        let mut scores: RrfScoreMap = HashMap::new();
-
-        // Add FTS ranks
-        for (rank, (id, content, metadata, fts_score, is_chunk, parent_id, chunk_index)) in
-            fts_results.iter().enumerate()
-        {
-            let rrf_score = 1.0 / (self.k as f64 + rank as f64 + 1.0);
-            scores.insert(
-                id.clone(),
-                (
-                    rrf_score,
-                    Some(*fts_score),
-                    None,
-                    content.clone(),
-                    metadata.clone(),
-                    *is_chunk,
-                    parent_id.clone(),
-                    *chunk_index,
-                ),
-            );
+    #[test]
+    fn metrics_have_lower_distance_for_nearer_vectors() {
+        let query = [1.0, 0.0];
+        for metric in [
+            DistanceMetric::Cosine,
+            DistanceMetric::Euclidean,
+            DistanceMetric::DotProduct,
+        ] {
+            assert!(distance(metric, &query, &[1.0, 0.0]) < distance(metric, &query, &[0.0, 1.0]));
         }
-
-        // Add vector ranks
-        for (rank, (id, content, metadata, vec_score, is_chunk, parent_id, chunk_index)) in
-            vector_results.iter().enumerate()
-        {
-            let rrf_score = 1.0 / (self.k as f64 + rank as f64 + 1.0);
-
-            scores
-                .entry(id.clone())
-                .and_modify(|(score, _fts, vec, _, _, _, _, _)| {
-                    *score += rrf_score;
-                    *vec = Some(*vec_score);
-                })
-                .or_insert((
-                    rrf_score,
-                    None,
-                    Some(*vec_score),
-                    content.clone(),
-                    metadata.clone(),
-                    *is_chunk,
-                    parent_id.clone(),
-                    *chunk_index,
-                ));
-        }
-
-        // Convert to sorted results
-        let mut results: Vec<SearchResult> = scores
-            .into_iter()
-            .map(
-                |(
-                    id,
-                    (
-                        score,
-                        fts_rank,
-                        vector_similarity,
-                        content,
-                        metadata,
-                        is_chunk,
-                        parent_id,
-                        chunk_index,
-                    ),
-                )| {
-                    SearchResult {
-                        id,
-                        content,
-                        metadata,
-                        score,
-                        fts_rank,
-                        vector_similarity,
-                        is_chunk,
-                        parent_id,
-                        chunk_index,
-                    }
-                },
-            )
-            .collect();
-
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
-
-        results
-    }
-}
-
-impl Default for HybridSearcher {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl HybridSearcher {
-    /// Detect a missing table/database error from SQLite and treat it as a soft miss.
-    fn is_missing_table_error(err: &anyhow::Error) -> bool {
-        if let Some(sqlx_err) = err.downcast_ref::<SqlxError>() {
-            if let SqlxError::Database(db_err) = sqlx_err {
-                let msg = db_err.message().to_lowercase();
-                return msg.contains("no such table") || msg.contains("no such database");
-            }
-        }
-        false
     }
 }

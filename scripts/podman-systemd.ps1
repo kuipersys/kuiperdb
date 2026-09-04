@@ -54,7 +54,7 @@ ExecStartPre=-/usr/bin/podman rm ${ContainerName}
 ExecStart=/usr/bin/podman run \
     --name ${ContainerName} \
     -d \
-    -p 8080:8080 \
+    -p 17001:17001 \
     -v kuiperdb-data:/app/data:Z \
     -v kuiperdb-logs:/app/logs:Z \
     -e RUST_LOG=info \

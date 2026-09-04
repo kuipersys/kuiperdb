@@ -1,101 +1,71 @@
-# kuiperdb
+# KuiperDB
 
-A lightweight, embeddable vector database built with Rust and SQLite. KuiperDb provides both a library and REST API for storing documents with vector embeddings and performing semantic similarity searches, making it ideal for local development, testing, embedded applications, or distributed environments.
+KuiperDB is a model-agnostic embedded vector database built on SQLite. Applications give it prepared records and vectors; KuiperDB provides stable identities, named vector spaces, indexed metadata filtering, relationships, nearest-neighbor retrieval, persistence, and derived HNSW indexes.
 
-## Overview
+Parsing, chunking, model inference, embedding caches, model management, and HTTP behavior are deliberately outside `kuiperdb-core`.
 
-KuiperDb combines SQLite's reliability with HNSW vector indexing to create a minimal yet powerful document store. The project features:
+## Workspace
 
-- **Vector Search**: Store and query documents using high-dimensional embeddings (configurable dimensions)
-- **HNSW Indexing**: Fast approximate nearest neighbor search with configurable parameters
-- **Dual Usage Modes**:
-  - **Embedded**: Use as a Rust library for direct integration
-  - **REST API**: Run as a server and connect via HTTP client
-- **Flexible Embedding**: Support for external embedding services with caching
-- **Background Workers**: Asynchronous embedding generation and processing
-- **Graph Operations**: Document relationship tracking and graph queries
-- **Feature Flags**: Configurable features for different deployment scenarios
+- `kuiperdb-core`: the embedded storage engine. It has no HTTP, model, tokenizer, cache, or worker dependencies.
+- `kuiperdb-server`: an optional Actix HTTP adapter over the same embedded API.
+- `kuiperdb-rs`: a client for that HTTP adapter.
 
-## Architecture
-
-KuiperDb is structured as a Rust workspace with three crates:
-
-- **kuiperdb-core** - Core library with storage, indexing, search, and embedding logic
-- **kuiperdb-client** - HTTP client for connecting to KuiperDb REST API
-- **kuiperdb** - Main binary and server runtime (can also be used as library)
-
-## Quick Start
-
-### As Library (Embedded)
+## Embedded usage
 
 ```rust
-use kuiperdb_core::*;
+use kuiperdb_core::{
+    Database, DistanceMetric, NamedVector, Normalization, RecordInput, VectorQuery, VectorSpace,
+};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let mut store = store::DocumentStore::new("./data".to_string()).await?;
-    
-    // Add document
-    let doc_id = store.add_document(/* ... */).await?;
-    
-    // Search
-    let results = store.search(/* ... */).await?;
-    
+    let db = Database::open("./data/app.db").await?;
+    db.create_vector_space(VectorSpace {
+        name: "image-features".into(),
+        dimensions: 3,
+        distance_metric: DistanceMetric::Cosine,
+        normalization: Normalization::Unit,
+        index: Default::default(),
+    }).await?;
+
+    db.put_record(RecordInput {
+        id: Some("asset-42".into()),
+        payload: Some(serde_json::json!({"uri": "images/42.png"})),
+        metadata: [("tenant".into(), serde_json::json!("acme"))].into(),
+        vectors: vec![NamedVector {
+            space: "image-features".into(),
+            values: vec![1.0, 0.0, 0.0],
+        }],
+    }).await?;
+
+    let nearest = db.search(VectorQuery {
+        space: "image-features".into(),
+        vector: vec![1.0, 0.0, 0.0],
+        limit: 10,
+        filter: Default::default(),
+    }).await?;
+    println!("{nearest:#?}");
     Ok(())
 }
 ```
 
-### As Server + Client
+## Server
+
+The server uses `KUIPERDB_PATH` (default `./data/kuiper.db`) and `KUIPERDB_BIND` (default `0.0.0.0:17001`).
 
 ```bash
-# Start server
-cargo run --release
-
-# In another terminal/application
+cargo run --release -p kuiperdb-server
 ```
 
-```rust
-use kuiperdb_client::Client;
+Its primitive search endpoint is `POST /search` and accepts a named space plus a vector. It never embeds query text.
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let client = Client::new("http://localhost:8080");
-    
-    // Add document
-    let doc_id = client.add_document(
-        "Hello world".to_string(),
-        None
-    ).await?;
-    
-    // Search
-    let results = client.search("greeting".to_string(), 10).await?;
-    
-    Ok(())
-}
-```
-
-## Building
+## Correctness and benchmarks
 
 ```bash
-# Build entire workspace
-cargo build --release
-
-# Run server
-cargo run --release
+cargo test --workspace --all-targets
+cargo bench -p kuiperdb-core
 ```
 
-For detailed build instructions, cross-compilation, CI/CD, and development commands, see [BUILD.md](BUILD.md).
+The tests exercise vector compatibility, exact and filtered retrieval, record updates and deletion, index rebuilds, reopen behavior, WAL readers/writers, cross-handle stale-index detection, and atomic batch failure. Benchmarks separate ANN query, exact query, index construction, and database-open time.
 
----
-
-## Disclaimer
-
-*The original project was generated with the assistance of Claude Sonnet 4.5 via GitHub Copilot in VS Code.*
-
-*I include these tools for transparency and provenance tracking in case this is ever useful to others in the future.*
-
-| Tool                | Version | Date       |
-| ------------------- | ------- | ---------- |
-| VsCode              | 1.107.1 | 2026.01.07 |
-| github.copilot-chat | 0.35.3  | 2026.01.07 |
-| Claude Sonnet       | 4.5     | 2026.01.07 |
+See [architecture](docs/architecture.md), [SQLite concurrency](docs/concurrency.md), and [index lifecycle](docs/index-lifecycle.md) for the behavioral contracts.

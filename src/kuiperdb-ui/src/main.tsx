@@ -8,7 +8,7 @@ import App from './App.tsx'
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
-    <KuiperDbProvider baseURL="/">
+    <KuiperDbProvider baseURL={import.meta.env.VITE_KUIPERDB_URL ?? 'http://localhost:17001'}>
       <MantineProvider>
         <ModalsProvider>
           <Notifications position="top-right" />

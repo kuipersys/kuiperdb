@@ -6,7 +6,7 @@
     Runs kuiperdb container using bind mounts to local directories instead of named volumes.
     Perfect for development with VS Code - directly access files in your workspace.
 .PARAMETER Port
-    Host port to expose (default: 8080)
+    Host port to expose (default: 17001)
 .PARAMETER DataDir
     Local directory for data (default: ./data)
 .PARAMETER LogsDir
@@ -24,7 +24,7 @@
 #>
 
 param(
-    [int]$Port = 8080,
+    [int]$Port = 17001,
     [string]$DataDir = "./data",
     [string]$LogsDir = "./logs",
     [string]$ContainerName = "kuiperdb-dev",
@@ -64,7 +64,7 @@ New-Item -ItemType Directory -Path $LogsDirAbs -Force | Out-Null
 $runArgs = @(
     "run",
     "--name", $ContainerName,
-    "-p", "${Port}:8080",
+    "-p", "${Port}:17001",
     "-v", "${DataDirAbs}:/app/data:Z",
     "-v", "${LogsDirAbs}:/app/logs:Z",
     "-e", "RUST_LOG=info",
