@@ -64,7 +64,53 @@ CREATE TRIGGER IF NOT EXISTS vectors_generation_delete AFTER DELETE ON vectors B
   UPDATE vector_spaces SET generation = generation + 1 WHERE name = OLD.space;
 END;
 PRAGMA user_version = 1;
+CREATE TABLE IF NOT EXISTS store_revision (
+    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+    revision INTEGER NOT NULL
+);
+INSERT OR IGNORE INTO store_revision VALUES (1, 0);
+CREATE TRIGGER IF NOT EXISTS records_revision_insert AFTER INSERT ON records BEGIN
+  UPDATE store_revision SET revision = revision + 1;
+END;
+CREATE TRIGGER IF NOT EXISTS records_revision_update AFTER UPDATE ON records BEGIN
+  UPDATE store_revision SET revision = revision + 1;
+END;
+CREATE TRIGGER IF NOT EXISTS records_revision_delete AFTER DELETE ON records BEGIN
+  UPDATE store_revision SET revision = revision + 1;
+END;
+CREATE TRIGGER IF NOT EXISTS relations_revision_insert AFTER INSERT ON relations BEGIN
+  UPDATE store_revision SET revision = revision + 1;
+END;
+CREATE TRIGGER IF NOT EXISTS relations_revision_update AFTER UPDATE ON relations BEGIN
+  UPDATE store_revision SET revision = revision + 1;
+END;
+CREATE TRIGGER IF NOT EXISTS relations_revision_delete AFTER DELETE ON relations BEGIN
+  UPDATE store_revision SET revision = revision + 1;
+END;
+CREATE TRIGGER IF NOT EXISTS vectors_revision_insert AFTER INSERT ON vectors BEGIN
+  UPDATE store_revision SET revision = revision + 1;
+END;
+CREATE TRIGGER IF NOT EXISTS vectors_revision_update AFTER UPDATE ON vectors BEGIN
+  UPDATE store_revision SET revision = revision + 1;
+END;
+CREATE TRIGGER IF NOT EXISTS vectors_revision_delete AFTER DELETE ON vectors BEGIN
+  UPDATE store_revision SET revision = revision + 1;
+END;
 "#;
+
+/// Record upserts, relation inserts, then record deletions in one transaction.
+///
+/// Record inputs have the same replacement and vector-retention semantics as
+/// [`Database::put_records`]. Relations can refer to records created in this batch.
+/// Deletions run last and cascade to vectors, metadata, and incident relations;
+/// deleting a missing record is a no-op. Supply explicit IDs when referring to
+/// new records or relations, since [`Database::commit_batch`] returns only a bool.
+#[derive(Default)]
+pub struct WriteBatch {
+    pub records: Vec<RecordInput>,
+    pub relations: Vec<RelationInput>,
+    pub delete_records: Vec<String>,
+}
 
 /// A cloneable handle to one embedded KuiperDB database.
 ///
@@ -197,9 +243,67 @@ impl Database {
         if inputs.is_empty() {
             return Ok(Vec::new());
         }
+        let mut ids = Vec::with_capacity(inputs.len());
+        let inputs = inputs
+            .into_iter()
+            .map(|mut input| {
+                let id = input.id.get_or_insert_with(|| Uuid::new_v4().to_string());
+                ids.push(id.clone());
+                input
+            })
+            .collect();
+        self.commit_batch(
+            None,
+            WriteBatch {
+                records: inputs,
+                ..Default::default()
+            },
+        )
+        .await?;
+        let mut records = Vec::with_capacity(ids.len());
+        for id in ids {
+            records.push(
+                self.get_record(&id)
+                    .await?
+                    .context("record disappeared after commit")?,
+            );
+        }
+        Ok(records)
+    }
+
+    /// Persistent token advanced by record, vector, and relation mutations.
+    ///
+    /// Treat this as an opaque equality token, not a transaction count. It can
+    /// advance several times per commit and is shared by all database handles.
+    /// Vector-space configuration and process-local index changes are not tracked.
+    pub async fn revision(&self) -> Result<i64> {
+        Ok(
+            sqlx::query_scalar("SELECT revision FROM store_revision WHERE singleton = 1")
+                .fetch_one(&self.pool)
+                .await?,
+        )
+    }
+
+    /// Atomically apply a batch, optionally conditioned on [`Self::revision`].
+    ///
+    /// Read the revision before reading the state used to prepare the batch.
+    /// `Some(revision)` returns `Ok(false)` without writes if that token is stale;
+    /// reread state and prepare a fresh batch before retrying. `None` applies the
+    /// batch unconditionally. `Ok(true)` means committed, including an empty batch.
+    /// Validation errors can be returned before the revision is checked.
+    ///
+    /// SQLite serializes writers across handles and processes. Errors before
+    /// commit roll back all changes, including revision and index generations.
+    /// Cancellation before commit rolls back through SQLx's transaction; once
+    /// commit is in flight, cancellation does not establish whether it committed.
+    pub async fn commit_batch(
+        &self,
+        expected_revision: Option<i64>,
+        batch: WriteBatch,
+    ) -> Result<bool> {
         let spaces = self.space_map().await?;
-        let mut prepared = Vec::with_capacity(inputs.len());
-        for input in inputs {
+        let mut prepared = Vec::with_capacity(batch.records.len());
+        for input in batch.records {
             let id = input.id.unwrap_or_else(|| Uuid::new_v4().to_string());
             if id.is_empty() {
                 anyhow::bail!("record id cannot be empty");
@@ -221,6 +325,19 @@ impl Database {
         }
 
         let mut transaction = self.pool.begin().await?;
+        // Obtain the SQLite writer reservation before reading the revision.
+        // This also avoids a deferred read-to-write upgrade race across pools.
+        sqlx::query("UPDATE store_revision SET revision = revision WHERE singleton = 1")
+            .execute(&mut *transaction)
+            .await?;
+        let revision: i64 =
+            sqlx::query_scalar("SELECT revision FROM store_revision WHERE singleton = 1")
+                .fetch_one(&mut *transaction)
+                .await?;
+        if expected_revision.is_some_and(|expected| expected != revision) {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
         let now = Utc::now();
         for (id, payload, metadata, vectors) in &prepared {
             sqlx::query(
@@ -260,17 +377,24 @@ impl Database {
                 .await?;
             }
         }
-        transaction.commit().await?;
-
-        let mut records = Vec::with_capacity(prepared.len());
-        for (id, _, _, _) in prepared {
-            records.push(
-                self.get_record(&id)
-                    .await?
-                    .context("record disappeared after commit")?,
-            );
+        for relation in batch.relations {
+            let id = relation.id.unwrap_or_else(|| Uuid::new_v4().to_string());
+            if id.is_empty() || relation.kind.is_empty() {
+                anyhow::bail!("relation id and kind cannot be empty");
+            }
+            sqlx::query("INSERT INTO relations(id, source_id, target_id, kind, metadata, created_at) VALUES (?, ?, ?, ?, ?, ?)")
+                .bind(id).bind(relation.source_id).bind(relation.target_id)
+                .bind(relation.kind).bind(serde_json::to_string(&relation.metadata)?)
+                .bind(now).execute(&mut *transaction).await?;
         }
-        Ok(records)
+        for id in batch.delete_records {
+            sqlx::query("DELETE FROM records WHERE id = ?")
+                .bind(id)
+                .execute(&mut *transaction)
+                .await?;
+        }
+        transaction.commit().await?;
+        Ok(true)
     }
 
     pub async fn get_record(&self, id: &str) -> Result<Option<Record>> {

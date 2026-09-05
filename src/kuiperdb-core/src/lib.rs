@@ -13,4 +13,4 @@ pub mod store;
 pub use graph::{Graph, GraphStatistics, ShortestPath, TraversalResult};
 pub use index::IndexConfig;
 pub use models::*;
-pub use store::Database;
+pub use store::{Database, WriteBatch};
