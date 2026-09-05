@@ -57,3 +57,36 @@ END;
 CREATE TRIGGER IF NOT EXISTS vectors_generation_delete AFTER DELETE ON vectors BEGIN
     UPDATE vector_spaces SET generation = generation + 1 WHERE name = OLD.space;
 END;
+
+CREATE TABLE IF NOT EXISTS store_revision (
+    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+    revision INTEGER NOT NULL
+);
+INSERT OR IGNORE INTO store_revision VALUES (1, 0);
+CREATE TRIGGER IF NOT EXISTS records_revision_insert AFTER INSERT ON records BEGIN
+  UPDATE store_revision SET revision = revision + 1;
+END;
+CREATE TRIGGER IF NOT EXISTS records_revision_update AFTER UPDATE ON records BEGIN
+  UPDATE store_revision SET revision = revision + 1;
+END;
+CREATE TRIGGER IF NOT EXISTS records_revision_delete AFTER DELETE ON records BEGIN
+  UPDATE store_revision SET revision = revision + 1;
+END;
+CREATE TRIGGER IF NOT EXISTS relations_revision_insert AFTER INSERT ON relations BEGIN
+  UPDATE store_revision SET revision = revision + 1;
+END;
+CREATE TRIGGER IF NOT EXISTS relations_revision_update AFTER UPDATE ON relations BEGIN
+  UPDATE store_revision SET revision = revision + 1;
+END;
+CREATE TRIGGER IF NOT EXISTS relations_revision_delete AFTER DELETE ON relations BEGIN
+  UPDATE store_revision SET revision = revision + 1;
+END;
+CREATE TRIGGER IF NOT EXISTS vectors_revision_insert AFTER INSERT ON vectors BEGIN
+  UPDATE store_revision SET revision = revision + 1;
+END;
+CREATE TRIGGER IF NOT EXISTS vectors_revision_update AFTER UPDATE ON vectors BEGIN
+  UPDATE store_revision SET revision = revision + 1;
+END;
+CREATE TRIGGER IF NOT EXISTS vectors_revision_delete AFTER DELETE ON vectors BEGIN
+  UPDATE store_revision SET revision = revision + 1;
+END;

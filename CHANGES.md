@@ -1,5 +1,13 @@
 # KuiperDb Changelog
 
+## Unreleased
+
+- Added `WriteBatch` and `Database::commit_batch` for atomic record upserts,
+  relation inserts, and cascading record deletions.
+- Added persistent revision tokens and conditional commits for optimistic
+  concurrency across independent handles and processes. The revision table and
+  triggers are additive for existing v0.2 databases.
+
 ## v0.2.0 - Model-agnostic embedded core
 
 - Replaced document-centric storage with stable records, opaque JSON payloads and metadata, and generic relationships.

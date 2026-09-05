@@ -49,6 +49,12 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
+For operations that update records, add relationships, and delete records together,
+use `Database::commit_batch` with a `WriteBatch`. An optional persistent revision
+token rejects stale read/modify/write operations across processes. See
+[conditional atomic batches](docs/concurrency.md#conditional-atomic-batches) for
+ordering, retries, and compatibility guarantees.
+
 ## Server
 
 The server uses `KUIPERDB_PATH` (default `./data/kuiper.db`) and `KUIPERDB_BIND` (default `0.0.0.0:17001`).
